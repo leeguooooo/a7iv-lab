@@ -239,7 +239,7 @@ def _path_state(path):
 
 
 def activate_staged(*, activation_authorized=False, slot1_confirmed=False, lease=None, journal=None,
-                    rename_fn=None):
+                    rename_fn=None, report_path=None):
     """Activate a reviewed staged file for preview only; no installation license.
 
     Caller must explicitly approve activation and independently confirm Slot 1.
@@ -251,18 +251,21 @@ def activate_staged(*, activation_authorized=False, slot1_confirmed=False, lease
     if lease is not None:
         require(_held_lease(lease), 'Caller-held CameraDeviceLease required')
         assert_operation_allowed(journal,allowed_states=('SD_STAGE_INTENT','SD_STAGED'))
-        return _activate_staged(rename_fn or rename_exclusive)
+        return _activate_staged(rename_fn or rename_exclusive, report_path)
     with CameraDeviceLease('sd-activate'):
         assert_operation_allowed(journal,allowed_states=('SD_STAGE_INTENT','SD_STAGED'))
-        return _activate_staged(rename_fn or rename_exclusive)
+        return _activate_staged(rename_fn or rename_exclusive, report_path)
 
 
-def _activate_staged(rename_fn):
+def _activate_staged(rename_fn, report_path=None):
+    report = Path(report_path) if report_path is not None else REPORT
+    require(all(not p.is_symlink() for p in (report, *report.parents)),
+            'Unsafe local activation report path')
     candidate = root_update = backup = None
     phase = 'LOCAL_COMPLETED_REPORT'
     try:
-        completed_path = REPORT / 'completed.json'
-        require(REPORT.is_dir() and not REPORT.is_symlink() and completed_path.is_file()
+        completed_path = report / 'completed.json'
+        require(report.is_dir() and not report.is_symlink() and completed_path.is_file()
                 and not completed_path.is_symlink(), 'Regular completed stage report required')
         completed = json.loads(completed_path.read_text())
         require(completed.get('state') == 'STAGED_UNRECOGNIZED_FILE_VERIFIED_NOT_ACTIVATED'
@@ -270,23 +273,31 @@ def _activate_staged(rename_fn):
                 and completed.get('existing_root_update_unchanged') is True
                 and completed.get('BODYDATA_DAT_created_or_replaced') is False
                 and completed.get('updater_invoked') is False, 'Verified completed stage report required')
-        volume = completed['volume_identity']
-        body = volume.get('body_sha256')
-        require(volume.get('body_matched') is True and isinstance(body, str) and len(body) == 64
+        staged_volume = completed['volume_identity']
+        body = staged_volume.get('body_sha256')
+        require(staged_volume.get('body_matched') is True and isinstance(body, str) and len(body) == 64
                 and all(c in '0123456789abcdef' for c in body), 'Completed report lacks bound body SHA')
-        identity_keys = ('device', 'parent', 'mount', 'volume_uuid', 'registry_id', 'body_sha256')
+        stable_keys = ('body_sha256', 'volume_uuid', 'filesystem', 'volume_bytes')
+        require(isinstance(staged_volume.get('volume_uuid'), str) and staged_volume['volume_uuid']
+                and staged_volume.get('filesystem') in ('exfat', 'msdos')
+                and type(staged_volume.get('volume_bytes')) is int and staged_volume['volume_bytes'] > 0,
+                'Completed report lacks stable card identity')
+        relative = staged_relative_path(completed.get('target'), staged_volume.get('mount'), DIGEST)
+        volume = dict(discover())
+        require(volume.get('body_matched') is True
+                and all(volume.get(key) == staged_volume[key] for key in stable_keys),
+                'Camera/card identity changed before or during activation')
+        identity_keys = (*stable_keys, 'device', 'parent', 'mount', 'registry_id')
         def verify_identity():
             current = discover()
             require(current.get('body_matched') is True
                     and all(current.get(key) == volume[key] for key in identity_keys),
                     'Camera/card identity changed before or during activation')
-        verify_identity()
         mount = Path(volume['mount'])
-        folder = (mount / staged_relative_path(completed.get('target'), str(mount), DIGEST)).parent
+        folder = (mount / relative).parent
         candidate, root_update, backup = folder/'candidate.staged', mount/'BODYDATA.DAT', folder/'original-BODYDATA.DAT'
         require(mount.resolve() == mount and all(p.is_dir() and not p.is_symlink()
                 for p in (mount, folder.parent, folder)), 'Unsafe staging path')
-        require(completed.get('target') == str(candidate), 'Completed target differs from staged receipt path')
         def verify_candidate():
             require(candidate.is_file() and not candidate.is_symlink() and candidate.stat().st_size == SIZE
                     and digest(candidate, uncached=True) == DIGEST, 'Staged candidate changed')
@@ -296,12 +307,12 @@ def _activate_staged(rename_fn):
         require(snapshot_existing(mount) == existing, 'Original root BODYDATA changed')
         require(not backup.exists() and not backup.is_symlink(), 'Original BODYDATA backup already exists')
         require(candidate.stat().st_dev == mount.stat().st_dev, 'Same-volume staged candidate required')
-        save(REPORT/'activation-intent.json', dict(state='CARD_FILENAME_ACTIVATION_INTENT',
+        save(report/'activation-intent.json', dict(state='CARD_FILENAME_ACTIVATION_INTENT',
              source=str(candidate), target=str(root_update), backup=str(backup),
              volume_identity=volume, existing_root_update=existing,
              slot1_manually_confirmed=True, installation_authorized=False,
              updater_invoked=False, automatic_retry=False, automatic_rollback=False))
-        _sync_directory(REPORT)
+        _sync_directory(report)
         phase = 'INTENT_DURABLE_BEFORE_CARD_RENAME'
         verify_identity(); verify_candidate()
         require(not root_update.is_symlink() and snapshot_existing(mount) == existing,
@@ -326,7 +337,7 @@ def _activate_staged(rename_fn):
                       volume_identity=volume, slot1_manually_confirmed=True,
                       updater_invoked=False, installation_authorized=False,
                       camera_internal_firmware_modified=False, automatic_retry=False)
-        save(REPORT/'activated-preview-only.json', result)
+        save(report/'activated-preview-only.json', result)
         return result
     except BaseException as error:
         stopped = dict(state='ACTIVATION_STOPPED_UNKNOWN', phase=phase,
@@ -335,7 +346,7 @@ def _activate_staged(rename_fn):
                        updater_invoked=False, installation_authorized=False,
                        automatic_retry=False, automatic_rollback=False)
         try:
-            save(REPORT/'activation-stopped.json', stopped)
+            save(report/'activation-stopped.json', stopped)
         except BaseException:
             pass
         raise

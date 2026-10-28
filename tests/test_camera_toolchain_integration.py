@@ -34,7 +34,7 @@ class IntegrationTests(unittest.TestCase):
             menu_folder=root/'menu-evidence';menu_folder.mkdir()
             body='b'*64;plan='a'*64
             volume=dict(device='disk900s1',parent='disk900',mount=str(card),volume_uuid='model-card',
-                        registry_id=900,body_matched=True,body_sha256=body,filesystem='exfat')
+                        volume_bytes=8<<30,registry_id=900,body_matched=True,body_sha256=body,filesystem='exfat')
             channel=SyntheticMenu(bytes.fromhex(self.meta['nonce']))
             attempts={'session':0,'normal':0,'exit':0}
             def exclusive(a,b):

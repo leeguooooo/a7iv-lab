@@ -30,7 +30,7 @@ class StageTests(unittest.TestCase):
         self.original = self.body.read_bytes()
         self.report = self.root / 'report'
         self.volume = dict(device='disk900s1', parent='disk900', mount=str(self.mount),
-                           volume_uuid='synthetic-uuid', registry_id=900,
+                           volume_uuid='synthetic-uuid', volume_bytes=8 << 30, registry_id=900,
                            body_matched=True, body_sha256='a' * 64, filesystem='exfat')
         self.stack = contextlib.ExitStack()
         self.addCleanup(self.stack.close)
@@ -204,6 +204,93 @@ class ActivationTests(unittest.TestCase):
         self.assertEqual(result['state'], 'ACTIVATED_PREVIEW_ONLY')
         self.assertFalse(result['updater_invoked'])
         self.assertFalse(result['installation_authorized'])
+
+    def test_selected_report_activates_after_reconnect_and_mount_change(self):
+        selected = self.root / 'selected-attempt-report'
+        stage.stage(report_path=selected)
+        self.assertFalse(self.report.exists())
+        self.report = selected
+        self.calls = []
+        remounted = self.root / 'remounted-card'
+        self.mount.rename(remounted)
+        self.mount, self.body = remounted, remounted / 'BODYDATA.DAT'
+        current = dict(self.volume, device='disk901s1', parent='disk901', registry_id=901,
+                       mount=str(remounted))
+        self.discover.return_value = current
+        result = self.activate(report_path=selected)
+        self.assertEqual(self.body.read_bytes(), self.payload)
+        self.assertEqual((self.folder / 'original-BODYDATA.DAT').read_bytes(), self.original)
+        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(result['volume_identity'], current)
+        self.assertEqual(result['target'], str(self.body))
+        self.assertTrue((selected / 'activation-intent.json').is_file())
+        self.assertTrue((selected / 'activated-preview-only.json').is_file())
+        self.assertFalse((self.root / 'report').exists())
+        self.assertFalse(result['installation_authorized'])
+        self.assertFalse(result['updater_invoked'])
+
+    def test_reconnect_with_changed_stable_identity_never_renames(self):
+        self.prepare()
+        changed_values = dict(volume_uuid='other-card', body_sha256='b' * 64,
+                              filesystem='msdos', volume_bytes=self.volume['volume_bytes'] + 4096)
+        for key, value in changed_values.items():
+            with self.subTest(field=key):
+                self.discover.return_value = dict(self.volume, **{key: value})
+                with self.assertRaisesRegex(ValueError, 'identity changed'):
+                    self.activate()
+                self.assertEqual(self.calls, [])
+                self.assertEqual(self.body.read_bytes(), self.original)
+                self.assertEqual((self.folder / 'candidate.staged').read_bytes(), self.payload)
+
+    def test_missing_stable_receipt_identity_is_refused(self):
+        self.prepare()
+        path = self.report / 'completed.json'
+        completed = json.loads(path.read_text())
+        del completed['volume_identity']['volume_bytes']
+        path.write_text(json.dumps(completed))
+        with self.assertRaisesRegex(ValueError, 'stable card identity'):
+            self.activate()
+        self.discover.assert_not_called()
+        self.assertEqual(self.calls, [])
+
+    def test_selected_report_and_its_parents_cannot_be_symlinks(self):
+        self.prepare()
+        alias = self.root / 'report-alias'
+        alias.symlink_to(self.report, target_is_directory=True)
+        parent = self.root / 'parent-alias'
+        parent.symlink_to(self.root, target_is_directory=True)
+        for selected in (alias, parent / self.report.name):
+            with self.subTest(path=selected):
+                with self.assertRaisesRegex(ValueError, 'Unsafe local activation report path'):
+                    self.activate(report_path=selected)
+                self.discover.assert_not_called()
+                self.assertEqual(self.calls, [])
+                self.assertFalse((self.report / 'activation-stopped.json').exists())
+
+    def assert_handle_change_after_backup_stops(self, field):
+        self.prepare()
+        current = dict(self.volume, device='disk901s1', parent='disk901', registry_id=901)
+        changed = dict(current, **{field: 'changed-again'})
+        self.discover.side_effect = [current, current, changed]
+        with self.assertRaisesRegex(ValueError, 'identity changed'):
+            self.activate()
+        self.assertEqual(len(self.calls), 1)
+        self.assertFalse(self.body.exists())
+        self.assertEqual((self.folder / 'original-BODYDATA.DAT').read_bytes(), self.original)
+        self.assertEqual((self.folder / 'candidate.staged').read_bytes(), self.payload)
+        self.assert_stopped()
+
+    def test_new_device_change_after_backup_stops(self):
+        self.assert_handle_change_after_backup_stops('device')
+
+    def test_new_parent_change_after_backup_stops(self):
+        self.assert_handle_change_after_backup_stops('parent')
+
+    def test_new_registry_change_after_backup_stops(self):
+        self.assert_handle_change_after_backup_stops('registry_id')
+
+    def test_new_mount_change_after_backup_stops(self):
+        self.assert_handle_change_after_backup_stops('mount')
 
     def test_legacy_completed_receipt_still_activates_its_exact_candidate(self):
         self.prepare()
