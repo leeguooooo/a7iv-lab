@@ -30,3 +30,18 @@
 待连接状态不会放行正式安装、新窗口、其他工作流或取消。操作者重新连接并选择 MSC 后，可单独授权既有 `restore` 动作。它只在一次重新核实机身的会话中读取原窗口的 ready、patched 和终态记录，核对原 nonce、原程序及原生恢复证明；即使已超过 600 秒也必须取得证明。成功后才记录专用的 `RAM_RESTORATION_VERIFIED`，不上传或 START 新程序。USB、认证、终态或 STOP 未知仍保留为 `STOPPED_UNKNOWN`，不自动重试、复位或重启。
 
 待重连记录位于 `menu/session-awaiting-reconnect.json`，与 `window-result.json` 相同。原补丁观察和完整待重连记录的哈希都绑定到审计事件。新的分步交接流程已通过离线验证，尚未重新进行真机验收。已使用的一次性原生任务不能重用；下一轮实机实验需另行准备新任务和新计划。
+
+## 一次性安装补丁的离线开发
+
+独立的 `INSTALL_VOLATILE_PATCH` 模块已接入离线构建和校验，尚无设备执行器。以下命令只读取本地原件、交叉编译，并在 Unicorn 的合成环境中验证目标指令，不连接相机。构建目录必须不存在，报告不会覆盖。
+
+```sh
+.venv-offline/bin/python -B -E -s tools/build_install_volatile_offline.py --output output/install-volatile-review-01
+.venv-offline/bin/python -B -E -s tools/verify_install_volatile_offline.py --output output/install-volatile-review-01
+.venv-offline/bin/python -B -E -s tools/emulate_install_volatile_offline.py --job output/install-volatile-review-01 --bootstrap-report output/install-volatile-review-01/bootstrap-model-report.json
+.venv-offline/bin/python -B -E -s camera_toolchain.py check --tests --install-volatile-job output/install-volatile-review-01 --report output/install-volatile-review-01/toolchain-check.json
+```
+
+新模块使用 `M4IVP001/version2` 和独立 START 协议。成功时两处补丁有意保留，关闭两个内存句柄后发布终态并退出，不再计时恢复。提交边界前的失败保留原目标身份检查和反向恢复；提交后的关闭或发布异常仍可能留下补丁，不能重试或声称已恢复。最终记录先写入并关闭临时文件，再以 `RENAME_NOREPLACE` 发布，关闭或重命名失败不能产生新的成功终态。
+
+主机验证器只核对三份回执的字节、身份和状态一致性，不证明它们来自真实设备。`VOLATILE_PATCH_APPLIED_NOT_RESTORED` 不等于 RAM 恢复、菜单接纳或安装成功。工具链检查同时核对完整 worker 与 bootstrap 模型及其源码、产物、nonce 绑定，仍保持 `installation_authorized=false`。真实 Linux 调用、缓存一致性、进程切换、正式安装交接和取消流程尚待验证，现有演练入口继续使用原协议。
