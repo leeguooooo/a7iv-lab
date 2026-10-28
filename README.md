@@ -1,4 +1,4 @@
-# camera-use
+# a7iv-lab
 
 Sony A7 IV / ILCE-7M4 的固件研究代码、离线校验工具和分步操作原型。
 
