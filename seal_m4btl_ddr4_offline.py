@@ -1,0 +1,49 @@
+"""Seal existing offline compiled fixed4B diagnostic candidate; no runner."""
+from pathlib import Path
+from elftools.elf.elffile import ELFFile
+from elftools.elf.relocation import RelocationSection
+import json,hashlib,struct,shutil,datetime
+R=Path(__file__).resolve().parent;D=R/'local/build/pcidma-ddr4-once-01/build/ddr4-once';O=R/'output/pcidma-OFFLINE_DDR4_ONCE-01';A={'scnprintf','__get_free_pages','__udif_cache_ctrl','arch_p32_to_p64','pcidma_transfer_async','arch_va_to_phys'}
+def sha(b):return hashlib.sha256(b).hexdigest()
+def save(p,x):p.write_text(json.dumps(x,indent=2)+'\n')
+def main():
+ data=(D/'m4btl_ddr4_01.stripped.ko').read_bytes();assert len(data)<=65520
+ with (D/'m4btl_ddr4_01.stripped.ko').open('rb')as f:
+  e=ELFFile(f);s={v.name:v for v in e.get_section_by_name('.symtab').iter_symbols()if v.name};u=sorted(v.name for v in s.values()if v['st_shndx']=='SHN_UNDEF');assert set(u)==A;assert e['e_type']=='ET_REL'and e['e_machine']=='EM_AARCH64'and e.little_endian
+  tm=e.get_section_by_name('.gnu.linkonce.this_module');assert tm['sh_size']==768 and tm.data()[24:].split(b'\0')[0]==b'm4btl_ddr4_01';assert not any(tm.data()[0x2b8:0x2c0])and 'cleanup_module'not in s and e.get_section_by_name('__versions')is None
+  rel=[]
+  for rs in e.iter_sections():
+   if isinstance(rs,RelocationSection):
+    st=e.get_section(rs['sh_link']);name=e.get_section(rs['sh_info']).name
+    for x in rs.iter_relocations():
+     y=st.get_symbol(x['r_info_sym']);sec=e.get_section(y['st_shndx']).name if isinstance(y['st_shndx'],int) else y['st_shndx'];rel.append(dict(section=name,offset=x['r_offset'],symbol=y.name,symbol_section=sec,addend=x['r_addend'],type=x['r_info_type']))
+  t=[x for x in rel if x['section']==tm.name];assert len(t)==1 and t[0]['offset']==0x158 and t[0]['symbol']=='init_module'
+  life={}
+  for n in ['request','context','owned_va','initialized','submitted','cached','result_word']:
+   sec=e.get_section(s[n]['st_shndx']).name;assert sec=='.bss';life[n]=dict(section=sec,bytes=s[n]['st_size'])
+  assert s['request']['st_size']==64 and e.get_section(s['dma_complete']['st_shndx']).name=='.text';life['dma_complete']={'section':'.text','bytes':s['dma_complete']['st_size']}
+  pb=e.get_section_by_name('__param').data();assert len(pb)==80;pmap={x['offset']:x for x in rel if x['section']=='__param'};params=[]
+  for off in [0,40]:
+   n=pmap[off];name=e.get_section_by_name(n['symbol_section']).data()[n['addend']:].split(b'\0')[0].decode();perm,lev,flags=struct.unpack_from('<HbB',pb,off+24);expected=0o200 if name=='submit' else 0o400;assert perm==expected and lev==-1 and flags==0;assert not any(pb[off+32:off+40])and off+32 not in pmap;assert pmap[off+8]['symbol']=='__this_module'
+   op=s[name+'_ops'];osec=e.get_section(op['st_shndx']);assert pmap[off+16]['symbol_section']==osec.name and pmap[off+16]['addend']==op['st_value'];raw=osec.data()[op['st_value']:op['st_value']+32];assert not any(raw[:4])and not any(raw[24:32]);ors={x['offset']-op['st_value']:x for x in rel if x['section']==osec.name and op['st_value']<=x['offset']<op['st_value']+32};wanted={8:'submit_set'}if name=='submit'else{8:'reject_set',16:'status_get'};assert set(ors)==set(wanted)
+   for offset,fn in wanted.items():assert ors[offset]['symbol_section']==e.get_section(s[fn]['st_shndx']).name and ors[offset]['addend']==s[fn]['st_value']
+   params.append(dict(name=name,permissions=oct(perm),ops=wanted,owner='__this_module',arg_NULL=True))
+  for n in ['.symtab','.strtab','.modinfo','.rela.text','.rela.init.text','.rela__param','.rela.gnu.linkonce.this_module']:assert e.get_section_by_name(n)is not None
+  mi=e.get_section_by_name('.modinfo').data().decode().replace('\0','\n')
+ with (D/'m4btl_ddr4_01.ko').open('rb')as f,(D/'m4btl_ddr4_01.stripped.ko').open('rb')as g:
+  a,b=ELFFile(f),ELFFile(g);retained={v.name:dict(bytes=v['sh_size'],same=a.get_section_by_name(v.name).data()==v.data(),sha256=sha(v.data()))for v in b.iter_sections()if v['sh_flags']&2};assert all(v['same']for v in retained.values())
+ with (R/'local/analysis/normal-kernel-6.02.elf').open('rb')as f:
+  k=ELFFile(f);ks={v.name:v['st_value']for v in k.get_section_by_name('.symtab').iter_symbols()};sg=next(v for v in k.iter_segments()if v['p_type']=='PT_LOAD');raw=sg.data();base=sg['p_vaddr'];exports={}
+  for n in u:
+   loc=ks['__ksymtab_'+n];fn,sp=struct.unpack_from('<QQ',raw,loc-base);assert raw[sp-base:].split(b'\0')[0].decode()==n;exports[n]=dict(table_entry=hex(loc),function=hex(fn))
+ bind=json.loads((O/'analysis-binding.json').read_text());model=json.loads((O/'offline-model.json').read_text());extra=json.loads((O/'root-extra-model.json').read_text());assert bind['candidate_sha256']==model['candidate_sha256']==extra['module_sha256']==sha(data)and bind['analysis_sha256']==sha((D/'m4btl_ddr4_01.analysis.elf').read_bytes())and model['assertions_passed'];assert len(model['cases'])==21
+ audit=dict(candidate_sha256=sha(data),undefined_imports=u,exports_verified_actual_normal=exports,boot_lifetime=life,parameters=params,module_struct_bytes=768,init_relocation='0x158->init_module',exit_NULL=True,retained_alloc_payloads=retained,relocations=rel,modinfo=mi,no_CRC_forged=True,modpost='Succeeded; only missing Module.symvers warning, actual export whitelist independently checked',camera_io=False)
+ save(O/'elf-audit.json',audit);src=O/'source';src.mkdir(exist_ok=True)
+ for n in ['m4btl_ddr4_01.c','identity.h','Makefile','model.ld']:shutil.copyfile(D/n,src/n)
+ for p,n in [(D/'m4btl_ddr4_01.stripped.ko','m4btl_ddr4_01.ko'),(D/'m4btl_ddr4_01.analysis.elf','analysis-model.elf'),(D/'m4btl_ddr4_01.analysis.map','analysis-model.map'),(D.parent.parent/'module-build.log','build.log'),(D.parent.parent/'model-link.log','model-link.log')]:shutil.copyfile(p,O/n)
+ nonce=json.loads((D.parent.parent/'identity.json').read_text())['nonce'];tools=O/'offline-tools';tools.mkdir(exist_ok=True)
+ for p in [Path(__file__),R/'emulate_m4btl_ddr4_offline.py']:shutil.copyfile(p,tools/p.name)
+ (O/'README.md').write_text('OFFLINE DIAGNOSTIC CANDIDATE. Never loaded or submitted. Init only prepares own RAM; root-only exact nonce submit would enqueue one fixed4B candidate address read. Source region/epoch admission remains pending: byte0/byte1 static consumers known, bytes2/3 unknown; do not interpret rawword as verified bootflag. No AP runner in this bundle. Request/cookie/callback/page persist to reboot; no cancel/reset/free/reuse/unload. Host observation expiry is PENDING, never retry. See manifest, source and synthetic model limits.\n')
+ m=dict(schema='m4btl-offline-ddr4-once/1',status='OFFLINE_NOT_AUTHORIZED_TO_LOAD_OR_SUBMIT',sealed_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),module_name='m4btl_ddr4_01',module_nonce=nonce,nonce_encoding='32 lowercasehex ASCII, compiled fixed16-byte random identity',module_file='m4btl_ddr4_01.ko',module_bytes=len(data),module_sha256=sha(data),status_path='/sys/module/m4btl_ddr4_01/parameters/status',status_permissions='0400',submit_path='/sys/module/m4btl_ddr4_01/parameters/submit',submit_permissions='0200',submit_bytes_ascii=nonce,submit_bytes_count=32,submit_success_sysfs_return=32,optional_single_submit_LF=True,getter_supplies_LF=False,wire_LF='Exactly one appended by actual param_attr_show',status_schema='schema=1 profile=ddr4-once nonce=<32hex> state=<ready|pending|done|error|submit-error> page_bytes=4096 page_phys=0x<lowerhex> submitted=<0|1> done=<0|1> err=<signed> rc=<signed> word_valid=<0|1> word=0x<8lowerhex> resident=boot source=0x403e42000 pci=0 dmac=4 size=4\n',ready_fields=dict(state='ready',submitted=0,done=0,err=0,rc=-115,word_valid=0,word='0x00000000',resident='boot'),page=dict(bytes=4096,physical_min='0x400000000',physical_max='0x4fffff000',alignment=4096,owner='New self allocated order0 page, not existing lease/PDT'),source=dict(p32='0x03e42000',required_p64='0x403e42000',region_verified=False,admitted_as_DDR=False,semantics='byte0 text selector; byte1 poll; bytes2/3 unknown; rawword uninterpreted',scope_request_blocked_pending_region_review=True),request=dict(pci=0,dmac=4,dir='READ',size=4,max_submissions=1,storage='Static module BSS request/cookie; ordinary text callback, all boot-lifetime',FIFO='Shared standard channel; head-of-line delays remain'),cache=dict(predma='Own aligned4096B FROM_DEVICE op2 before enqueue in process context',postdma='Own same4096B op2 after done acquire/err0/APIrc0 then exactly4B read once',callback='Own-cookie+one-claim, err then release done; no cache/page/free'),allowed_undefined_imports=u,source_hashes={str(p.relative_to(O)):sha(p.read_bytes())for p in src.iterdir()},base_model_cases=21,root_extra_cases=10,exact_analysis_binding=True,actual_show_store_wrappers_in_model=True,host_poll_contract='50x100ms observation; deadline only PENDING, never retry/cancel/free/unload',module_loads_performed=0,real_DMA_requests=0,camera_io=False,AP_runner_created=False,no_exit_free_stop_reset_reuse=True,does_not_modify_loaded_lease=True,requires_new_scope_for_kernel_load_and_independent_submit=True,whole_GPL500_equals_600=False,selected_ABI_evidence='local/build/pcidma-abi-01/evidence/prepared-headers-and-abi.json',source_comparison_evidence='output/sony-gpl-full-content-comparison-01/comparison.json',compiler_limit='UbuntuGCC11 selected ABI, not whole SonyGCC6.4 identity')
+ m['files']={str(p.relative_to(O)):dict(bytes=p.stat().st_size,sha256=sha(p.read_bytes()))for p in O.rglob('*')if p.is_file()and p.name!='manifest.json'};save(O/'manifest.json',m);print(json.dumps(dict(bundle=str(O.relative_to(R)),schema=m['schema'],module=m['module_name'],nonce=nonce,bytes=len(data),sha256=m['module_sha256'],sealed=m['sealed_utc'])))
+if __name__=='__main__':main()

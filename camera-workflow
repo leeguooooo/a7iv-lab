@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+workflow_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+workflow_python="$workflow_root/Sony-PMCA-RE/.venv/bin/python"
+if [ ! -x "$workflow_python" ]; then
+  workflow_python=$(command -v python3)
+fi
+if [ -e "$workflow_root/output/workflow-absent-bytecode-cache" ]; then
+  printf '%s\n' '源码执行缓存隔离路径已存在，请先离线核查；未启动工具。' >&2
+  exit 1
+fi
+exec "$workflow_python" -B -E -s -X "pycache_prefix=$workflow_root/output/workflow-absent-bytecode-cache" "$workflow_root/camera_workflow.py" "$@"

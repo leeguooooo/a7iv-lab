@@ -1,0 +1,28 @@
+name: Source checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  portable:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Compile Python sources
+        run: python -m compileall -q .
+      - name: Exercise offline walkthrough
+        run: |
+          ./camera-workflow steps
+          ./camera-workflow simulate --scenario usb-lost
+      - name: Run portable host tests without firmware or devices
+        run: |
+          python -m unittest discover -s tests -p test_camera_workflow_simulator.py
+          python -m unittest discover -s tests -p test_camera_device_lease.py
+          python -m unittest discover -s tests -p test_camera_install_journal.py
+          python -m unittest discover -s tests -p test_camera_operation_guard.py
+          python -m unittest discover -s tests -p test_camera_package_audit.py
+          python -m unittest discover -s tests -p test_fl23_prewrite_guard.py
