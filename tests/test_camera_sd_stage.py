@@ -36,6 +36,8 @@ class StageTests(unittest.TestCase):
         self.addCleanup(self.stack.close)
         self.lease = self.stack.enter_context(mock.patch.object(stage, 'CameraDeviceLease'))
         self.stack.enter_context(mock.patch.object(stage, 'assert_operation_allowed'))
+        self.nonce = self.stack.enter_context(mock.patch.object(stage.secrets, 'token_hex',
+                                                               return_value='0123456789abcdef'))
         for name, value in [('SOURCE', self.source), ('DIGEST', self.sha),
                             ('SIZE', len(self.payload)), ('REPORT', self.report)]:
             self.stack.enter_context(mock.patch.object(stage, name, value))
@@ -49,7 +51,7 @@ class StageTests(unittest.TestCase):
 
     @property
     def folder(self):
-        return self.mount / '.camera-use-staging' / ('fl23-' + self.sha[:16])
+        return self.mount / '.camera-use-staging' / ('fl23-' + self.sha[:16] + '-0123456789abcdef')
 
     def assert_no_success(self):
         self.assertFalse((self.report / 'completed.json').exists())
@@ -98,6 +100,21 @@ class StageTests(unittest.TestCase):
         self.assertEqual(previous.read_bytes(), b'previous attempt must remain intact')
         self.assertEqual(self.body.read_bytes(), self.original)
         self.assert_no_success()
+
+    def test_fresh_attempts_preserve_legacy_and_each_other(self):
+        legacy = self.mount / '.camera-use-staging' / ('fl23-' + self.sha[:16]) / 'candidate.staged'
+        self.nonce.side_effect = ['0123456789abcdef', 'fedcba9876543210']
+        legacy.parent.mkdir(parents=True)
+        legacy.write_bytes(b'earlier evidence')
+        first = stage.stage(report_path=self.root / 'first-report')
+        second = stage.stage(report_path=self.root / 'second-report')
+        self.assertNotEqual(first['target'], second['target'])
+        for result in (first, second):
+            self.assertEqual(Path(result['target']).read_bytes(), self.payload)
+            self.assertRegex(Path(result['target']).parent.name,
+                             '^fl23-' + self.sha[:16] + '-[0-9a-f]{16}$')
+        self.assertEqual(legacy.read_bytes(), b'earlier evidence')
+        self.assertEqual(self.body.read_bytes(), self.original)
 
     def test_bad_target_readback_stops_without_success_report(self):
         original_digest = stage.digest
@@ -187,6 +204,30 @@ class ActivationTests(unittest.TestCase):
         self.assertEqual(result['state'], 'ACTIVATED_PREVIEW_ONLY')
         self.assertFalse(result['updater_invoked'])
         self.assertFalse(result['installation_authorized'])
+
+    def test_legacy_completed_receipt_still_activates_its_exact_candidate(self):
+        self.prepare()
+        legacy = self.folder.with_name('fl23-' + self.sha[:16])
+        self.folder.rename(legacy)
+        completed_path = self.report / 'completed.json'
+        completed = json.loads(completed_path.read_text())
+        completed['target'] = str(legacy / 'candidate.staged')
+        completed_path.write_text(json.dumps(completed))
+        self.activate()
+        self.assertEqual(self.body.read_bytes(), self.payload)
+        self.assertEqual((legacy / 'original-BODYDATA.DAT').read_bytes(), self.original)
+
+    def test_completed_receipt_cannot_select_arbitrary_card_path(self):
+        self.prepare()
+        completed_path = self.report / 'completed.json'
+        completed = json.loads(completed_path.read_text())
+        completed['target'] = str(self.mount / 'elsewhere' / 'candidate.staged')
+        completed_path.write_text(json.dumps(completed))
+        with self.assertRaisesRegex(ValueError, 'Unsafe staged receipt path'): self.activate()
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.body.read_bytes(), self.original)
+        self.assertEqual((self.folder / 'candidate.staged').read_bytes(), self.payload)
+        self.assert_stopped()
 
     def test_existing_backup_is_never_overwritten(self):
         self.prepare()

@@ -11,6 +11,8 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import re
+import secrets
 import stat
 import subprocess
 from camera_device_lease import CameraDeviceLease
@@ -107,6 +109,23 @@ def snapshot_existing(mount):
     return {'exists':True, 'bytes':path.stat().st_size, 'sha256':digest(path, uncached=True)}
 
 
+def staged_relative_path(target, mount, sha256):
+    """Accept only receipt-bound legacy or isolated attempt candidate names."""
+    require(isinstance(target, str) and isinstance(mount, str), 'Unsafe staged receipt path')
+    base, path = Path(mount), Path(target)
+    require(base.is_absolute() and path.is_absolute(), 'Unsafe staged receipt path')
+    try:
+        relative = path.relative_to(base)
+    except ValueError:
+        raise ValueError('Unsafe staged receipt path') from None
+    parts = relative.parts
+    require(len(parts) == 3 and parts[0] == '.camera-use-staging'
+            and re.fullmatch('fl23-' + re.escape(sha256[:16]) + r'(?:-[0-9a-f]{16})?', parts[1])
+            and parts[2] == 'candidate.staged' and str(base / relative) == target,
+            'Unsafe staged receipt path')
+    return relative
+
+
 def _held_lease(lease):
     return (isinstance(lease, _LeaseType) and lease.fd is not None
             and isinstance(lease.metadata, dict) and lease.metadata.get('state') == 'HELD')
@@ -139,7 +158,7 @@ def _stage(report_path=None):
     parent=mount/'.camera-use-staging'
     if parent.exists():require(parent.is_dir() and not parent.is_symlink(), 'Staging parent unsafe')
     else:parent.mkdir()
-    folder=parent/('fl23-'+DIGEST[:16]);folder.mkdir()  # Never overwrite or silently resume another attempt.
+    folder=parent/('fl23-'+DIGEST[:16]+'-'+secrets.token_hex(8));folder.mkdir()
     target=folder/'candidate.staged'
     try:
         written=0
@@ -263,11 +282,11 @@ def _activate_staged(rename_fn):
                     'Camera/card identity changed before or during activation')
         verify_identity()
         mount = Path(volume['mount'])
-        folder = mount / '.camera-use-staging' / ('fl23-' + DIGEST[:16])
+        folder = (mount / staged_relative_path(completed.get('target'), str(mount), DIGEST)).parent
         candidate, root_update, backup = folder/'candidate.staged', mount/'BODYDATA.DAT', folder/'original-BODYDATA.DAT'
         require(mount.resolve() == mount and all(p.is_dir() and not p.is_symlink()
                 for p in (mount, folder.parent, folder)), 'Unsafe staging path')
-        require(completed.get('target') == str(candidate), 'Completed target differs from fixed staging path')
+        require(completed.get('target') == str(candidate), 'Completed target differs from staged receipt path')
         def verify_candidate():
             require(candidate.is_file() and not candidate.is_symlink() and candidate.stat().st_size == SIZE
                     and digest(candidate, uncached=True) == DIGEST, 'Staged candidate changed')

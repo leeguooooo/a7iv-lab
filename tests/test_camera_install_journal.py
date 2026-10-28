@@ -351,6 +351,30 @@ class JournalTests(unittest.TestCase):
         path.write_text(json.dumps(report))
         return path, report
 
+    def test_operator_reconnect_pending_blocks_new_work_cancel_and_flash(self):
+        artifact, _ = self.ram_report()
+        self.journal.advance('RAM_AWAITING_OPERATOR_RECONNECT')
+        self.assertNotIn(self.journal.state, ledger.TERMINAL_SAFE)
+        self.assertEqual(ledger.InstallJournal.open(self.journal.session_dir).state,
+                         'RAM_AWAITING_OPERATOR_RECONNECT')
+        with self.assertRaises(ledger.JournalError):
+            ledger.assert_no_pending_installs(self.root)
+        for state in ('READY_FOR_CONFIRMATION', 'FLASH_MAY_HAVE_STARTED',
+                      'CANCELLED_BEFORE_DEVICE_WRITE', 'RAM_MAY_BE_ACTIVE'):
+            with self.subTest(state=state), self.assertRaises(ledger.JournalError):
+                self.journal.advance(state)
+        with self.assertRaises(ledger.JournalError):
+            ledger.InstallJournal.create(self.root, 'another', **self.binding)
+        self.journal.record_ram_restoration_verified(artifact)
+        ledger.assert_no_pending_installs(self.root)
+
+    def test_operator_reconnect_pending_can_become_unknown(self):
+        self.ram_report()
+        self.journal.advance('RAM_AWAITING_OPERATOR_RECONNECT')
+        self.journal.advance('STOPPED_UNKNOWN')
+        with self.assertRaises(ledger.JournalError):
+            ledger.assert_no_pending_installs(self.root)
+
     def test_normal_ram_restoration_closes_without_unknown_or_install_success(self):
         artifact, _ = self.ram_report()
         previous = self.journal.events

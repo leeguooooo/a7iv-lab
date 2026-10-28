@@ -4,15 +4,12 @@ A patch publication alone never authorizes unplug or installation. The existing
 normal-session helper owns its success-only STOP. This adapter adds no STOP,
 reset, reboot, authentication retry, or card activation operation.
 """
-import contextlib
 import hashlib
-import io
 import json
 import math
 import os
 import stat
 from pathlib import Path
-import sys
 import time
 
 from camera_device_lease import CameraDeviceLease
@@ -28,6 +25,11 @@ def require(ok, message):
         raise ValueError(message)
 
 
+def _receipt_sha256(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'),
+                                     allow_nan=False).encode()).hexdigest()
+
+
 def _require_held_lease(lease):
     require(isinstance(lease, CameraDeviceLease) and lease.fd is not None
             and isinstance(lease.metadata, dict) and lease.metadata.get('state') == 'HELD',
@@ -39,51 +41,15 @@ def _require_held_lease(lease):
             'Live caller lease descriptor required')
 
 
-def _probe_normal(expected):
-    """One read-only normal enumeration/info query; SDK imports remain lazy."""
-    require(isinstance(expected, str) and len(expected) == 64
-            and all(c in '0123456789abcdef' for c in expected), 'Reference body SHA-256 required')
-    from camera_stream_usb_session import _finite_timeout
-    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-        sdk_path = str(ROOT / 'Sony-PMCA-RE')
-        if sdk_path not in sys.path:
-            sys.path.insert(0, sdk_path)
-        from pmca.commands.usb import importDriver, listDevices
-        from pmca.usb.sony import SonyMscExtCmdDevice, SonyExtCmdCamera
-        from pmca.usb.driver.generic import GenericUsbDriver
-        with importDriver('libusb') as driver:
-            devices = list(listDevices(driver, quiet=True))
-            if not devices:
-                return None
-            require(len(devices) == 1, 'Ambiguous normal-mode USB identity')
-            normal = devices[0]
-            if not isinstance(normal, SonyMscExtCmdDevice):
-                return None
-            require(isinstance(normal.driver, GenericUsbDriver)
-                    and normal.driver.getId() == (0x054c, 0x0da5), 'Unsupported normal USB path')
-            require(_finite_timeout(normal.driver), 'Finite normal libusb timeout required')
-            require(SonyExtCmdCamera(normal).getCameraInfo().modelName == 'ILCE-7M4', 'Normal model changed')
-            serial = normal.driver.backend.dev.serial_number
-            require(isinstance(serial, str) and bool(serial)
-                    and hashlib.sha256(serial.encode()).hexdigest() == expected, 'Normal reference body mismatch')
-            return dict(model='ILCE-7M4', body_sha256=expected, body_matched=True,
-                        usb_vendor=0x054c, usb_product=0x0da5, finite_driver_timeout=True)
-
-
-def wait_for_normal(expected_body_sha256, *, timeout=30, clock=time.monotonic, sleep=time.sleep):
-    require(type(timeout) in (int, float) and math.isfinite(timeout) and 0 < timeout <= 30,
-            'Bounded normal-mode wait required')
-    deadline = clock() + timeout
-    while clock() < deadline:
-        result = _probe_normal(expected_body_sha256)
-        if result is not None:
-            return result
-        sleep(0.25)
-    raise TimeoutError('Same-body normal MSC did not reappear; RAM state remains unknown')
+def _known_service_exit(events):
+    stops = [event for event in events if event.get('event') == 'STOP_RESPONSE']
+    require(len(stops) == 1 and stops[0].get('mode') == 'service'
+            and (stops[0].get('success') is True or stops[0].get('known_pipe_response') is True),
+            'Known service STOP response required')
 
 
 def run_menu_session(expected_body_sha256, evidence, *, plan_sha256, journal, lease,
-                     ram_authorized=False, run_session=None, wait_normal=None,
+                     ram_authorized=False, run_session=None,
                      start_fn=None, window_assets=None, capture_assets=None,
                      clock=time.monotonic, sleep=time.sleep):
     """Caller holds a lease and supplies a fresh, body-bound SD_STAGED ledger.
@@ -93,7 +59,6 @@ def run_menu_session(expected_body_sha256, evidence, *, plan_sha256, journal, le
     """
     folder = Path(evidence)
     phase = 'LOCAL_PREFLIGHT'
-    started = clock()
     ram_intent_persisted = device_session_started = intent_persistence_attempted = False
     try:
         require(ram_authorized is True, 'Explicit RAM authorization required')
@@ -111,22 +76,18 @@ def run_menu_session(expected_body_sha256, evidence, *, plan_sha256, journal, le
         journal.advance('RAM_MAY_BE_ACTIVE', details={'operation': 'menu-window', 'automatic_retry': False})
         ram_intent_persisted = True
         phase = 'RAM_MAY_BE_ACTIVE'
-        hardware = run_session is None and start_fn is None and wait_normal is None
+        hardware = run_session is None and start_fn is None
         if run_session is None:
             from camera_stream_usb_session import run_normal_session
             run_session = run_normal_session
         if start_fn is None:
             from camera_menu_window import start_authenticated
             start_fn = start_authenticated
-        if wait_normal is None:
-            wait_normal = wait_for_normal
         events = []
-        observed_at = None
         def set_stage(value):
             nonlocal phase
             phase = value
         def work(device):
-            nonlocal observed_at
             options={}
             if window_assets is not None:options['assets']=window_assets
             if capture_assets is not None:options['capture_assets']=capture_assets
@@ -136,17 +97,12 @@ def run_menu_session(expected_body_sha256, evidence, *, plan_sha256, journal, le
                     and observed.get('state') == 'PATCH_OBSERVED_AWAITING_KNOWN_EXIT_AND_NORMAL_BODY'
                     and type(observed.get('source_is_hardware')) is bool
                     and observed.get('installation_authorized') is False, 'Validated patch observation required')
-            budget = observed.get('conservative_seconds_remaining')
-            require(type(budget) in (int, float) and math.isfinite(budget) and budget >= 120,
-                    'Insufficient patch window before service exit')
             observed = dict(observed, source_is_hardware=hardware and observed['source_is_hardware'])
-            observed_at = clock()
-            require(math.isfinite(observed_at) and observed_at >= started,
-                    'Monotonic clock regressed during patch observation')
             return observed
         device_session_started = True
         patch = run_session(expected_body_sha256, work, record_event=events.append, set_stage=set_stage)
-        phase = 'KNOWN_SERVICE_EXIT_AWAITING_NORMAL'
+        phase = 'KNOWN_SERVICE_EXIT_AWAITING_OPERATOR_RECONNECT'
+        _known_service_exit(events)
         require(isinstance(patch, dict)
                 and patch.get('state') == 'PATCH_OBSERVED_AWAITING_KNOWN_EXIT_AND_NORMAL_BODY'
                 and type(patch.get('source_is_hardware')) is bool
@@ -154,35 +110,22 @@ def run_menu_session(expected_body_sha256, evidence, *, plan_sha256, journal, le
         patch = dict(patch, source_is_hardware=hardware and patch['source_is_hardware'])
         remaining = patch.get('conservative_seconds_remaining')
         require(type(remaining) in (int, float) and math.isfinite(remaining), 'Finite patch budget required')
-        normal = wait_normal(expected_body_sha256, timeout=30, clock=clock, sleep=sleep)
-        require(isinstance(normal, dict) and normal.get('model') == 'ILCE-7M4'
-                and normal.get('body_sha256') == expected_body_sha256
-                and normal.get('body_matched') is True and normal.get('usb_vendor') == 0x054c
-                and normal.get('usb_product') == 0x0da5 and normal.get('finite_driver_timeout') is True,
-                'Same-body normal MSC proof required')
-        now = clock()
-        require(observed_at is not None and math.isfinite(now) and now >= observed_at >= started,
-                'Monotonic clock regressed during handoff')
-        elapsed = now - observed_at
-        require(math.isfinite(elapsed) and remaining - elapsed >= 90,
-                'Insufficient conservative window after service exit and normal reappearance')
-        result = dict(state='VOLATILE_WINDOW_HANDOFF', plan_sha256=plan_sha256,
+        result = dict(state='RAM_AWAITING_OPERATOR_RECONNECT', plan_sha256=plan_sha256,
                       body_sha256=expected_body_sha256, model='ILCE-7M4',
-                      patch_observation=patch, normal_body=normal, service_exit_completed=True,
+                      patch_observation=patch, service_events=events, service_exit_completed=True,
                       source_is_hardware=patch['source_is_hardware'],
-                      normal_body_reappearance_verified=True, conservative_seconds_remaining=remaining-elapsed,
-                      budget_basis='patch_report_remaining_minus_post_observation_elapsed',
-                      patch_observed_monotonic=observed_at, post_observation_elapsed_seconds=elapsed,
+                      normal_body_reappearance_verified=False, conservative_seconds_remaining=remaining,
+                      budget_basis='historical_patch_observation_information_only',
+                      operator_reconnect_required=True,
                       installation_authorized=False, firmware_installation_proven=False,
                       RAM_original_state_verified=False, timer_is_independent_watchdog=False,
                       automatic_retry=False, automatic_STOP=False, automatic_reboot=False)
-        journal.advance('READY_FOR_CONFIRMATION', details={
-            'state': result['state'], 'conservative_seconds_remaining': remaining-elapsed,
-            'budget_basis': result['budget_basis'],
-            'window_nonce':patch['nonce'],
-            'patch_observation_sha256':hashlib.sha256(json.dumps(patch,sort_keys=True,separators=(',',':')).encode()).hexdigest(),
+        durable_new(folder / 'session-awaiting-reconnect.json', result)
+        journal.advance('RAM_AWAITING_OPERATOR_RECONNECT', details={
+            'state': result['state'], 'window_nonce':patch['nonce'],
+            'patch_observation_sha256':_receipt_sha256(patch),
+            'pending_receipt_sha256':_receipt_sha256(result),
             'installation_authorized': False})
-        durable_new(folder / 'session-handoff.json', result)
         return result
     except BaseException as error:
         # Preserve the original exception even when local report/ledger persistence fails.
@@ -254,9 +197,9 @@ def collect_menu_restoration(expected_body_sha256, evidence, handoff, *, plan_sh
         binding = dict(plan_sha256=plan_sha256, body_sha256=expected_body_sha256, model='ILCE-7M4')
         require(journal.binding == binding, 'Journal plan/body binding mismatch')
         fresh = InstallJournal.open(journal.session_dir)
-        require(fresh.events == journal.events and fresh.state in ('READY_FOR_CONFIRMATION', 'RAM_MAY_BE_ACTIVE'),
+        require(fresh.events == journal.events and fresh.state == 'RAM_AWAITING_OPERATOR_RECONNECT',
                 'Fresh open volatile RAM journal required')
-        assert_operation_allowed(journal, allowed_states=('READY_FOR_CONFIRMATION', 'RAM_MAY_BE_ACTIVE'))
+        assert_operation_allowed(journal, allowed_states=('RAM_AWAITING_OPERATOR_RECONNECT',))
         require(not any(event['state'] == 'FLASH_MAY_HAVE_STARTED' for event in fresh.events),
                 'Collection forbidden after possible firmware flash')
         require(isinstance(handoff, dict) and all(handoff.get(key) == value for key, value in binding.items()),
@@ -266,6 +209,14 @@ def collect_menu_restoration(expected_body_sha256, evidence, handoff, *, plan_sh
                 and observation.get('state') == 'PATCH_OBSERVED_AWAITING_KNOWN_EXIT_AND_NORMAL_BODY'
                 and type(observation.get('source_is_hardware')) is bool,
                 'Original patch observation and evidence kind required')
+        pending = fresh.events[-1]['details']
+        observation_sha = _receipt_sha256(observation)
+        require(pending.get('window_nonce') == observation.get('nonce')
+                and pending.get('patch_observation_sha256') == observation_sha,
+                'Original patch differs from pending RAM event')
+        require(pending.get('pending_receipt_sha256') == _receipt_sha256(handoff),
+                'Original handoff differs from pending RAM receipt')
+        _known_service_exit(handoff.get('service_events', []))
         # Reject inconsistent/missing original evidence before a default real
         # session. Model callbacks remain useful for pure host tests only.
         require(observation['source_is_hardware'] is True
@@ -300,6 +251,7 @@ def collect_menu_restoration(expected_body_sha256, evidence, handoff, *, plan_sh
         attempted = True
         collected = run_session(expected_body_sha256, work, record_event=events.append, set_stage=set_stage)
         phase = 'KNOWN_COLLECTION_SERVICE_EXIT'
+        _known_service_exit(events)
         verified, native = _restoration_native_proof(observation, collected)
         result = dict(state='RAM_RESTORATION_RECEIPT_OBSERVED', scope='VOLATILE_RAM_WINDOW_ONLY',
             **binding, source_is_hardware=hardware, all_passed=True,
@@ -308,7 +260,7 @@ def collect_menu_restoration(expected_body_sha256, evidence, handoff, *, plan_sh
             firmware_flash_was_never_started=True,
             firmware_never_started_operator_confirmed=True,
             firmware_installation_proven=False, installation_authorized=False,
-            service_exit_completed=True, module_uploads=0, START_attempts=0,
+            service_exit_completed=True, service_events=events, module_uploads=0, START_attempts=0,
             timer_is_independent_watchdog=False, elapsed_time_is_not_restoration_proof=True,
             automatic_retry=False, automatic_STOP=False, automatic_reboot=False)
         artifact = folder/'ram-restoration.json'

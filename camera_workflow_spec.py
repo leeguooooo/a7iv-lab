@@ -16,7 +16,7 @@ STEPS = (
         action('stage', '暂存非更新文件', '复制候选并完整校验，保留已有 BODYDATA.DAT。'),
         action('libraries', '核对实际完整库文件', '双遍只读采集两个原库，须匹配精确基线。'),
         action('window', '执行一次临时 RAM 窗口', '独立授权后加载临时程序；只改两处 RAM 指令。'),
-        action('handoff', '核对正常模式返回', '确认已知服务退出与同一机身重新出现，未知则停止。'),
+        action('handoff', '等待操作者重新连接', '已知服务退出后保留待连接记录；操作者重新连接并选择 MSC，再单独授权收集。'),
         action('restore', '收集 RAM 恢复证明', '读取原窗口终态，计时结束不能代替恢复证明。'))),
     dict(number=3, id='install', title='正式安装', description='当前实操入口锁定；模拟只展示流程和风险。', actions=(
         action('consent', '重新核对并确认安装范围', '正式安装需新鲜现场条件及明确授权；演练许可不外推。'),

@@ -55,11 +55,8 @@ class IntegrationTests(unittest.TestCase):
                 result=work(object())
                 if stop_unknown:raise OSError('synthetic unknown STOP')
                 attempts['exit']+=1
+                record_event({'event':'STOP_RESPONSE','mode':'service','known_pipe_response':True})
                 return result
-            def normal(expected,**kwargs):
-                attempts['normal']+=1
-                return dict(model='ILCE-7M4',body_sha256=body,body_matched=True,
-                            usb_vendor=0x054c,usb_product=0x0da5,finite_driver_timeout=True)
             with patch.object(sd,'SOURCE',source),patch.object(sd,'DIGEST',hashlib.sha256(payload).hexdigest()), \
                  patch.object(sd,'SIZE',len(payload)),patch.object(sd,'REPORT',report), \
                  patch.object(sd,'discover',return_value=volume), \
@@ -77,7 +74,7 @@ class IntegrationTests(unittest.TestCase):
                     self.assertEqual(len(backups),1);self.assertEqual(backups[0].read_bytes(),b'original preserve')
                     j.advance('SD_STAGED')
                     call=lambda:run_menu_session(body,menu_folder,plan_sha256=plan,journal=j,lease=lease,
-                        ram_authorized=True,run_session=session,wait_normal=normal,start_fn=start,
+                        ram_authorized=True,run_session=session,start_fn=start,
                         clock=lambda:100.0,sleep=lambda _:None)
                     if stop_unknown:
                         with self.assertRaises(OSError):call()
@@ -85,13 +82,13 @@ class IntegrationTests(unittest.TestCase):
                         self.assertEqual(attempts['normal'],0)
                     else:
                         result=call()
-                        self.assertEqual(j.state,'READY_FOR_CONFIRMATION')
-                        self.assertEqual(result['state'],'VOLATILE_WINDOW_HANDOFF')
+                        self.assertEqual(j.state,'RAM_AWAITING_OPERATOR_RECONNECT')
+                        self.assertEqual(result['state'],'RAM_AWAITING_OPERATOR_RECONNECT')
                         self.assertFalse(result['installation_authorized'])
                         self.assertFalse(result['firmware_installation_proven'])
                         self.assertFalse(result['source_is_hardware'])
                         self.assertFalse(result['patch_observation']['source_is_hardware'])
-                        self.assertEqual(attempts,dict(session=1,normal=1,exit=1))
+                        self.assertEqual(attempts,dict(session=1,normal=0,exit=1))
                     self.assertEqual((channel.uploads,channel.starts),(1,1))
                 # Even a released host lease does not clear pending on-camera work.
                 with self.assertRaises(JournalError):assert_no_pending_installs(root/'sessions')

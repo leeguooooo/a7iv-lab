@@ -16,7 +16,7 @@ from camera_workflow_spec import STEPS, SCENARIOS
 ROOT = Path(__file__).resolve().parent
 DEVICE_ACTIONS = ('settings', 'stage', 'window', 'restore')
 STATES = {'settings': ('PLANNED',), 'stage': ('PLANNED',),
-          'window': ('SD_STAGED',), 'restore': ('READY_FOR_CONFIRMATION',)}
+          'window': ('SD_STAGED',), 'restore': ('RAM_AWAITING_OPERATOR_RECONNECT',)}
 SHA = re.compile(r'[0-9a-f]{64}\Z')
 NAME = re.compile(r'[A-Za-z0-9_-]{1,64}\Z')
 
@@ -219,14 +219,16 @@ def checked_stage(folder,record,journal,root,*,result=None,require_event=True):
 
 def check_current_staged_card(result):
     """Read only; actual discovery must identify the same card before path use."""
-    from camera_sd_stage import discover,snapshot_existing,digest as card_digest
+    from camera_sd_stage import discover,snapshot_existing,staged_relative_path,digest as card_digest
     from camera_toolchain import PACKAGE_SHA
     current=discover();previous=result['volume_identity']
-    require(all(current.get(k)==previous.get(k) for k in
-                ('device','parent','mount','volume_uuid','registry_id','body_sha256')),
+    require(all(previous.get(k) and current.get(k)==previous[k] for k in
+                ('volume_uuid','body_sha256','filesystem','volume_bytes')),
             'Current camera/card differs from staged evidence')
-    target=Path(current['mount'])/'.camera-use-staging'/('fl23-'+PACKAGE_SHA[:16])/'candidate.staged'
-    require(str(target)==result['target'] and all(not p.is_symlink() for p in (target,*target.parents))
+    relative=staged_relative_path(result.get('target'),previous.get('mount'),PACKAGE_SHA)
+    target=Path(current['mount'])/relative
+    require(str(Path(previous['mount'])/relative)==result['target']
+            and all(not p.is_symlink() for p in (target,*target.parents))
             and target.is_file() and target.stat().st_size==757480856
             and card_digest(target,uncached=True)==PACKAGE_SHA,'Current staged card bytes changed')
     require(snapshot_existing(Path(current['mount']))==result['existing_root_update'],
@@ -236,10 +238,12 @@ def check_current_staged_card(result):
 def checked_window(folder,record,journal,root):
     from camera_menu_window import checked_job,asset_reference,FIELDS,FRAME,decode,ready_proof,patched_proof
     result=read_json(local_path(folder/'window-result.json',root))
-    require(result==read_json(local_path(folder/'menu/session-handoff.json',root))
-            and result.get('state')=='VOLATILE_WINDOW_HANDOFF' and result.get('source_is_hardware') is True
+    require(result==read_json(local_path(folder/'menu/session-awaiting-reconnect.json',root))
+            and result.get('state')=='RAM_AWAITING_OPERATOR_RECONNECT' and result.get('source_is_hardware') is True
             and all(result.get(k)==record[k] for k in ('plan_sha256','body_sha256','model')),
             'Original hardware window handoff required')
+    from camera_menu_session import _known_service_exit, _receipt_sha256
+    _known_service_exit(result.get('service_events', []))
     observation=result['patch_observation']
     require(observation.get('source_is_hardware') is True
             and observation.get('state')=='PATCH_OBSERVED_AWAITING_KNOWN_EXIT_AND_NORMAL_BODY',
@@ -257,11 +261,13 @@ def checked_window(folder,record,journal,root):
         return decode(FRAME.pack(b'M4DWL002',nonce,*(row[n] for n in FIELDS)),nonce)
     ready,patched=original(observation['ready']),original(observation['patched'])
     ready_proof(ready,ready['loader_pid']);patched_proof(patched,ready)
-    rows=[e for e in journal.events if e['state']=='READY_FOR_CONFIRMATION']
-    proof=hashlib.sha256(json.dumps(observation,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+    rows=[e for e in journal.events if e['state']=='RAM_AWAITING_OPERATOR_RECONNECT']
+    proof=_receipt_sha256(observation)
     require(len(rows)==1 and rows[0]['details'].get('window_nonce')==meta['nonce']
             and rows[0]['details'].get('patch_observation_sha256')==proof,
             'Window proof differs from durable RAM session event')
+    require(rows[0]['details'].get('pending_receipt_sha256')==_receipt_sha256(result),
+            'Window handoff differs from pending RAM receipt')
     return result
 
 
@@ -285,6 +291,7 @@ def device_action(path, action, *, authorize_step=False, camera_ready=False,
             checked_settings(folder,record,root)
         if action=='window':
             staged=checked_stage(folder,record,journal,root)
+            check_current_staged_card(staged)
         handoff=None
         if action=='restore':
             handoff=checked_window(folder,record,journal,root)
@@ -304,7 +311,6 @@ def device_action(path, action, *, authorize_step=False, camera_ready=False,
                 result=stage(lease=lease,journal=journal,report_path=folder/'card-stage')
                 checked_stage(folder,record,journal,root,result=result,require_event=False)
             elif action=='window':
-                check_current_staged_card(staged)
                 from camera_menu_session import run_menu_session
                 evidence=folder/'menu';evidence.mkdir(mode=0o700)
                 result=run_menu_session(record['body_sha256'],evidence,ram_authorized=True,**options)

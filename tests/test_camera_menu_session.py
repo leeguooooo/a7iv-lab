@@ -1,12 +1,8 @@
 """Temporary local ledgers and injected fake sessions only; no device actions."""
-import contextlib
 import hashlib
-import io
 import json
 from pathlib import Path
-import sys
 import tempfile
-from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -46,35 +42,67 @@ class OrchestrationTests(unittest.TestCase):
             self.calls.append('session')
             result = work('fake-authenticated-device')
             self.calls.append('known STOP')
+            kwargs['record_event']({'event':'STOP_RESPONSE','mode':'service','success':True})
             return result
         self.run = Mock(side_effect=run)
 
     def invoke(self, **overrides):
         opts = dict(plan_sha256=self.plan, journal=self.journal, lease=self.lease,
-                    ram_authorized=True, run_session=self.run, wait_normal=self.wait,
+                    ram_authorized=True, run_session=self.run,
                     start_fn=self.start, clock=self.clock, sleep=lambda _: None)
         opts.update(overrides)
         return session.run_menu_session(self.body, self.evidence, **opts)
 
     def assert_no_handoff(self):
-        self.assertFalse((self.evidence / 'session-handoff.json').exists())
+        self.assertFalse((self.evidence / 'session-awaiting-reconnect.json').exists())
         self.assertEqual(self.journal.state, 'STOPPED_UNKNOWN')
 
-    def test_success_orders_durable_intent_callback_known_exit_and_normal(self):
-        def wait(*args, **kwargs):
-            self.assertEqual(self.calls, ['session', 'known STOP'])
-            self.seconds = 15
-            return self.normal
-        self.wait.side_effect = wait
+    def test_known_stop_returns_pending_without_normal_probe_or_budget_deduction(self):
+        self.wait.side_effect = AssertionError('operator reconnect must not be probed')
         result = self.invoke()
-        self.assertEqual(result['state'], 'VOLATILE_WINDOW_HANDOFF')
-        self.assertEqual(result['conservative_seconds_remaining'], 165)
+        self.assertEqual(result['state'], 'RAM_AWAITING_OPERATOR_RECONNECT')
+        self.assertEqual(self.journal.state, 'RAM_AWAITING_OPERATOR_RECONNECT')
+        self.assertEqual(result['conservative_seconds_remaining'], 180)
+        self.assertEqual(json.loads((self.evidence/'session-awaiting-reconnect.json').read_text()), result)
+        self.wait.assert_not_called()
+
+    def test_return_without_explicit_stop_receipt_is_unknown(self):
+        self.run.side_effect = lambda expected, work, **kwargs: work('fake-device')
+        with self.assertRaisesRegex(ValueError, 'Known service STOP'):
+            self.invoke()
+        self.assertEqual(self.journal.state, 'STOPPED_UNKNOWN')
+
+    def test_pending_event_binds_entire_returned_and_persisted_receipt(self):
+        result = self.invoke()
+        persisted = json.loads((self.evidence/'session-awaiting-reconnect.json').read_text())
+        self.assertEqual(persisted, result)
+        proof = hashlib.sha256(json.dumps(persisted, sort_keys=True,
+            separators=(',', ':'), allow_nan=False).encode()).hexdigest()
+        self.assertEqual(InstallJournal.open(self.journal.session_dir).events[-1]['details']['pending_receipt_sha256'], proof)
+
+    def test_historical_patch_budget_is_not_pending_admission(self):
+        self.observed['conservative_seconds_remaining'] = 0
+        result = self.invoke()
+        self.assertEqual(result['state'], 'RAM_AWAITING_OPERATOR_RECONNECT')
+        self.assertEqual(result['conservative_seconds_remaining'], 0)
+
+    def test_known_pipe_stop_returns_pending(self):
+        def run(expected, work, **kwargs):
+            result = work('fake-device')
+            kwargs['record_event'](dict(event='STOP_RESPONSE', mode='service', known_pipe_response=True))
+            return result
+        self.run.side_effect = run
+        result = self.invoke()
+        self.assertEqual(self.journal.state, 'RAM_AWAITING_OPERATOR_RECONNECT')
+        self.assertTrue(result['service_events'][0]['known_pipe_response'])
+
+    def test_pending_preserves_known_stop_and_model_provenance(self):
+        result = self.invoke()
+        self.assertEqual(self.calls, ['session', 'known STOP'])
+        self.assertEqual(result['service_events'], [{'event':'STOP_RESPONSE','mode':'service','success':True}])
         self.assertFalse(result['installation_authorized'])
         self.assertFalse(result['RAM_original_state_verified'])
-        self.assertEqual(self.journal.state, 'READY_FOR_CONFIRMATION')
-        self.assertTrue((self.evidence / 'session-handoff.json').exists())
         self.assertTrue(self.start.call_args.kwargs['body_verified'])
-        self.assertFalse(self.start.call_args.kwargs['source_is_hardware'])
         self.assertFalse(result['patch_observation']['source_is_hardware'])
         self.assertFalse(result['source_is_hardware'])
 
@@ -127,38 +155,17 @@ class OrchestrationTests(unittest.TestCase):
         self.wait.assert_not_called()
         self.assert_no_handoff()
 
-    def test_wrong_normal_body_cannot_handoff(self):
-        self.normal['body_sha256'] = 'c' * 64
-        with self.assertRaisesRegex(ValueError, 'Same-body'): self.invoke()
-        self.assert_no_handoff()
-
-    def test_time_after_patch_observation_in_exit_and_normal_wait_is_deducted(self):
-        self.wait.side_effect = lambda *a, **kw: setattr(self, 'seconds', 91) or self.normal
-        with self.assertRaisesRegex(ValueError, 'Insufficient conservative window'): self.invoke()
-        self.assert_no_handoff()
-
-    def test_slow_capture_and_maps_wait_are_not_deducted_twice(self):
-        # Capture took 180s before native START; maps wait consumed 300 of its 600s.
-        def start(*args, **kwargs):
-            self.seconds = 480
-            return dict(self.observed, conservative_seconds_remaining=300)
-        def wait(*args, **kwargs):
-            self.seconds = 490  # Known STOP plus normal reappearance cost another 10s.
-            return self.normal
-        self.start.side_effect = start
-        self.wait.side_effect = wait
+    def test_slow_known_exit_does_not_consume_live_handoff_budget(self):
+        original = self.run.side_effect
+        def run(*args, **kwargs):
+            result = original(*args, **kwargs)
+            self.seconds = 900
+            return result
+        self.run.side_effect = run
         result = self.invoke()
-        self.assertEqual(result['conservative_seconds_remaining'], 290)
-        self.assertEqual(result['post_observation_elapsed_seconds'], 10)
-        self.assertEqual(result['patch_observed_monotonic'], 480)
-        self.assertEqual(result['budget_basis'], 'patch_report_remaining_minus_post_observation_elapsed')
-        self.assertFalse(result['timer_is_independent_watchdog'])
-
-    def test_clock_regression_after_patch_rejects_handoff(self):
-        self.start.side_effect = lambda *a, **kw: setattr(self, 'seconds', 100) or self.observed
-        self.wait.side_effect = lambda *a, **kw: setattr(self, 'seconds', 99) or self.normal
-        with self.assertRaisesRegex(ValueError, 'Monotonic clock regressed'): self.invoke()
-        self.assert_no_handoff()
+        self.assertEqual(result['conservative_seconds_remaining'], 180)
+        self.assertEqual(result['budget_basis'], 'historical_patch_observation_information_only')
+        self.wait.assert_not_called()
 
     def test_unheld_lease_makes_zero_device_calls(self):
         unheld = CameraDeviceLease('offline-unheld', lock_path=self.evidence.parent / 'unheld.lock')
@@ -191,7 +198,7 @@ class OrchestrationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'binding mismatch'):
             session.run_menu_session('c' * 64, self.evidence, plan_sha256=self.plan,
                 journal=self.journal, lease=self.lease, ram_authorized=True,
-                run_session=self.run, start_fn=self.start, wait_normal=self.wait)
+                run_session=self.run, start_fn=self.start)
         self.run.assert_not_called(); self.start.assert_not_called(); self.wait.assert_not_called()
         self.assertEqual(self.journal.events, before)
         self.assertEqual(InstallJournal.open(self.journal.session_dir).events, before)
@@ -209,11 +216,10 @@ class OrchestrationTests(unittest.TestCase):
         self.assertFalse((self.journal.session_dir / '00000005.json').exists())
 
     def assert_single_injection_is_model(self, argument):
-        values = dict(run_session=None, start_fn=None, wait_normal=None)
-        values[argument] = {'run_session': self.run, 'start_fn': self.start, 'wait_normal': self.wait}[argument]
+        values = dict(run_session=None, start_fn=None)
+        values[argument] = {'run_session': self.run, 'start_fn': self.start}[argument]
         with patch('camera_stream_usb_session.run_normal_session', self.run), \
-                patch('camera_menu_window.start_authenticated', self.start), \
-                patch.object(session, 'wait_for_normal', self.wait):
+                patch('camera_menu_window.start_authenticated', self.start):
             result = self.invoke(**values)
         self.assertFalse(result['source_is_hardware'])
         self.assertFalse(result['patch_observation']['source_is_hardware'])
@@ -221,9 +227,6 @@ class OrchestrationTests(unittest.TestCase):
 
     def test_injected_start_alone_forces_model_provenance(self):
         self.assert_single_injection_is_model('start_fn')
-
-    def test_injected_wait_alone_forces_model_provenance(self):
-        self.assert_single_injection_is_model('wait_normal')
 
     def test_injected_session_alone_forces_model_provenance(self):
         self.assert_single_injection_is_model('run_session')
@@ -258,86 +261,12 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(self.journal.state, 'STOPPED_UNKNOWN')
 
 
-class NormalDetectionTests(unittest.TestCase):
-    def setUp(self):
-        self.serial = 'offline-reference'
-        self.body = hashlib.sha256(self.serial.encode()).hexdigest()
-        class Driver:
-            def getId(self): return (0x054c, 0x0da5)
-        class Normal: pass
-        self.driver = Driver()
-        self.driver.backend = SimpleNamespace(dev=SimpleNamespace(default_timeout=5000, serial_number=self.serial))
-        self.device = Normal(); self.device.driver = self.driver
-        self.info = Mock(return_value=SimpleNamespace(modelName='ILCE-7M4'))
-        @contextlib.contextmanager
-        def import_driver(name):
-            print('SDK secret', file=sys.stderr)
-            yield object()
-        commands, sony, generic = (ModuleType(n) for n in ('pmca.commands.usb', 'pmca.usb.sony', 'pmca.usb.driver.generic'))
-        self.enumerate = Mock(return_value=[self.device])
-        commands.importDriver, commands.listDevices = import_driver, self.enumerate
-        sony.SonyMscExtCmdDevice = Normal
-        sony.SonyExtCmdCamera = lambda dev: SimpleNamespace(getCameraInfo=self.info)
-        generic.GenericUsbDriver = Driver
-        self.stack = contextlib.ExitStack(); self.addCleanup(self.stack.close)
-        self.stack.enter_context(patch.dict(sys.modules, {'pmca.commands.usb': commands,
-            'pmca.usb.sony': sony, 'pmca.usb.driver.generic': generic}))
-        self.original_path = sys.path[:]
-        self.addCleanup(lambda: sys.path.__setitem__(slice(None), self.original_path))
-
-    def test_only_readonly_normal_info_is_used_and_sdk_logs_suppressed(self):
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
-            proof = session._probe_normal(self.body)
-        self.assertEqual(out.getvalue(), '')
-        self.assertTrue(proof['body_matched'])
-        self.info.assert_called_once_with()
-        self.enumerate.assert_called_once()
-
-    def test_wrong_serial_is_rejected(self):
-        self.driver.backend.dev.serial_number = 'wrong-body'
-        with self.assertRaisesRegex(ValueError, 'body mismatch'): session._probe_normal(self.body)
-
-    def test_wrong_model_is_rejected(self):
-        self.info.return_value.modelName = 'ILCE-OTHER'
-        with self.assertRaisesRegex(ValueError, 'model changed'): session._probe_normal(self.body)
-
-    def test_wrong_pid_is_rejected_before_camera_info(self):
-        self.driver.getId = lambda: (0x054c, 0x0336)
-        with self.assertRaisesRegex(ValueError, 'Unsupported normal USB path'): session._probe_normal(self.body)
-        self.info.assert_not_called()
-
-    def test_invalid_reference_hash_is_rejected_before_enumeration(self):
-        with self.assertRaisesRegex(ValueError, 'SHA-256'): session._probe_normal('invalid')
-        self.enumerate.assert_not_called()
-
-    def test_infinite_or_invalid_driver_timeout_is_rejected(self):
-        for value in (None, 0, float('inf'), 6000):
-            with self.subTest(timeout=value):
-                self.driver.backend.dev.default_timeout = value
-                with self.assertRaisesRegex(ValueError, 'Finite normal'): session._probe_normal(self.body)
-        self.info.assert_not_called()
-
-    def test_ambiguous_devices_rejected(self):
-        self.enumerate.return_value = [self.device, self.device]
-        with self.assertRaisesRegex(ValueError, 'Ambiguous'): session._probe_normal(self.body)
-
-    def test_absence_times_out_without_recovery(self):
-        ticks = iter([0, 0, 31])
-        with patch.object(session, '_probe_normal', return_value=None) as probe:
-            with self.assertRaises(TimeoutError):
-                session.wait_for_normal(self.body, clock=lambda: next(ticks), sleep=lambda _: None)
-        probe.assert_called_once_with(self.body)
-
-
 class RestorationCollectionTests(unittest.TestCase):
     setUp = OrchestrationTests.setUp
 
-    def prepare_collection(self, *, ready=True, hardware=True):
+    def prepare_collection(self, *, ready=True, hardware=True, receipt_hash=None):
         import camera_menu_window as menu
         self.journal.advance('RAM_MAY_BE_ACTIVE')
-        if ready:
-            self.journal.advance('READY_FOR_CONFIRMATION')
         initial = {name: 0 for name in menu.FIELDS}
         initial.update(version=1, phase=1, euid=0, pid=234, ppid=1, loader_pid=123,
                        flags=13, snapshot_before_status=-11, snapshot_end_status=-11)
@@ -353,13 +282,19 @@ class RestorationCollectionTests(unittest.TestCase):
         self.observation = dict(self.observed, nonce=bytes(range(16)).hex(), ready=initial,
                                 patched=patched, source_is_hardware=hardware)
         self.handoff = dict(plan_sha256=self.plan, body_sha256=self.body, model='ILCE-7M4',
-                            patch_observation=self.observation)
+                            patch_observation=self.observation,
+                            service_events=[dict(event='STOP_RESPONSE',mode='service',success=True)])
+        self.journal.advance('RAM_AWAITING_OPERATOR_RECONNECT', details={
+            'window_nonce':self.observation['nonce'],
+            'patch_observation_sha256':hashlib.sha256(json.dumps(self.observation,sort_keys=True,separators=(',',':')).encode()).hexdigest(),
+            'pending_receipt_sha256':receipt_hash or hashlib.sha256(json.dumps(self.handoff,sort_keys=True,separators=(',',':'),allow_nan=False).encode()).hexdigest()})
         self.collect = Mock(return_value=dict(native=self.native, native_terminal_observed=True,
                                               both_RAM_targets_proven_safe=True))
         def run(expected, work, **kwargs):
             self.calls.append('collection session')
             result = work('fake-authenticated-device')
             self.calls.append('known collection STOP')
+            kwargs['record_event']({'event':'STOP_RESPONSE','mode':'service','success':True})
             return result
         self.run = Mock(side_effect=run)
         self.assets = object()
@@ -397,8 +332,9 @@ class RestorationCollectionTests(unittest.TestCase):
         self.assertTrue(self.collect.call_args.kwargs['body_verified'])
         self.assertTrue(self.collect.call_args.kwargs['firmware_never_started_confirmed'])
 
-    def test_ram_may_be_active_can_close_with_actual_receipt(self):
+    def test_pending_can_close_after_more_than_native_window_duration(self):
         self.prepare_collection(ready=False)
+        self.seconds = 10000
         self.invoke_hardware_collection()
         self.assertEqual(self.journal.state, 'RAM_RESTORATION_VERIFIED')
 
@@ -412,6 +348,41 @@ class RestorationCollectionTests(unittest.TestCase):
         self.run.assert_not_called(); self.collect.assert_not_called()
         self.assertEqual(InstallJournal.open(self.journal.session_dir).events, before)
 
+    def test_changed_original_patch_is_rejected_before_collection(self):
+        self.prepare_collection()
+        before = self.journal.events
+        self.observation['conservative_seconds_remaining'] = 999
+        with self.assertRaisesRegex(ValueError, 'pending RAM event'):
+            self.invoke_collection()
+        self.run.assert_not_called(); self.collect.assert_not_called()
+        self.assertEqual(self.journal.events, before)
+
+    def test_changed_known_stop_diagnostic_is_rejected_before_collection(self):
+        self.prepare_collection()
+        before = self.journal.events
+        self.handoff['service_events'][0] = dict(event='STOP_RESPONSE',mode='service',known_pipe_response=True)
+        session._known_service_exit(self.handoff['service_events'])
+        with self.assertRaisesRegex(ValueError, 'pending RAM receipt'):
+            self.invoke_hardware_collection()
+        self.run.assert_not_called(); self.collect.assert_not_called()
+        self.assertEqual(InstallJournal.open(self.journal.session_dir).events, before)
+
+    def test_wrong_pending_receipt_hash_is_rejected_before_collection(self):
+        self.prepare_collection(receipt_hash='e'*64)
+        before = self.journal.events
+        with self.assertRaisesRegex(ValueError, 'pending RAM receipt'):
+            self.invoke_hardware_collection()
+        self.run.assert_not_called(); self.collect.assert_not_called()
+        self.assertEqual(InstallJournal.open(self.journal.session_dir).events, before)
+
+    def test_collection_return_without_stop_evidence_is_unknown(self):
+        self.prepare_collection()
+        self.run.side_effect = lambda expected, work, **kwargs: work('fake-device')
+        with self.assertRaisesRegex(ValueError, 'Known service STOP'):
+            self.invoke_collection()
+        self.assertEqual(self.journal.state, 'STOPPED_UNKNOWN')
+        self.assertFalse((self.evidence/'ram-restoration.json').exists())
+
     def test_wrong_handoff_binding_is_local_rejection(self):
         self.prepare_collection()
         before = self.journal.events
@@ -422,7 +393,9 @@ class RestorationCollectionTests(unittest.TestCase):
 
     def test_flash_history_blocks_collection_without_any_session(self):
         self.prepare_collection()
-        self.journal.advance('FLASH_MAY_HAVE_STARTED')
+        with self.assertRaises(ValueError):
+            self.journal.advance('FLASH_MAY_HAVE_STARTED')
+        self.journal.advance('STOPPED_UNKNOWN')
         before = self.journal.events
         with self.assertRaises(ValueError): self.invoke_collection()
         self.run.assert_not_called(); self.collect.assert_not_called()

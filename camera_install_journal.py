@@ -25,18 +25,20 @@ class JournalError(ValueError):
 
 
 STATES = frozenset({
-    'PLANNED', 'SD_STAGE_INTENT', 'SD_STAGED', 'RAM_MAY_BE_ACTIVE',
+    'PLANNED', 'SD_STAGE_INTENT', 'SD_STAGED', 'RAM_MAY_BE_ACTIVE', 'RAM_AWAITING_OPERATOR_RECONNECT',
     'READY_FOR_CONFIRMATION', 'FLASH_MAY_HAVE_STARTED',
     'DEVICE_COMPLETION_REPORTED', 'CONTENT_VERIFIED', 'STOPPED_UNKNOWN',
     'CANCELLED_BEFORE_DEVICE_WRITE', 'MANUALLY_RECONCILED_SAFE', 'RAM_RESTORATION_VERIFIED',
+    'LOCAL_REJECTED_BEFORE_DEVICE_ENTRY',
 })
 TERMINAL_SAFE = frozenset({'CONTENT_VERIFIED', 'CANCELLED_BEFORE_DEVICE_WRITE',
-                           'MANUALLY_RECONCILED_SAFE', 'RAM_RESTORATION_VERIFIED'})
+                           'MANUALLY_RECONCILED_SAFE', 'RAM_RESTORATION_VERIFIED',
+                           'LOCAL_REJECTED_BEFORE_DEVICE_ENTRY'})
 NEXT = {
     'PLANNED': {'SD_STAGE_INTENT'},
     'SD_STAGE_INTENT': {'SD_STAGED'},
     'SD_STAGED': {'RAM_MAY_BE_ACTIVE', 'READY_FOR_CONFIRMATION'},
-    'RAM_MAY_BE_ACTIVE': {'READY_FOR_CONFIRMATION'},
+    'RAM_MAY_BE_ACTIVE': {'READY_FOR_CONFIRMATION', 'RAM_AWAITING_OPERATOR_RECONNECT'},
     'READY_FOR_CONFIRMATION': {'FLASH_MAY_HAVE_STARTED'},
     'FLASH_MAY_HAVE_STARTED': {'DEVICE_COMPLETION_REPORTED'},
     'DEVICE_COMPLETION_REPORTED': {'CONTENT_VERIFIED'},
@@ -107,10 +109,13 @@ def _transition(history, state):
         _require(state == 'PLANNED', 'First event must be PLANNED')
         return
     previous = history[-1]['state']
+    if state == 'LOCAL_REJECTED_BEFORE_DEVICE_ENTRY':
+        _require(previous == 'STOPPED_UNKNOWN', 'Local rejection requires STOPPED_UNKNOWN')
+        return
     if state == 'RAM_RESTORATION_VERIFIED':
         _require(not any(e['state'] == 'FLASH_MAY_HAVE_STARTED' for e in history),
                  'RAM restoration cannot clear possible flash writes')
-        _require(previous in {'RAM_MAY_BE_ACTIVE', 'READY_FOR_CONFIRMATION'},
+        _require(previous in {'RAM_MAY_BE_ACTIVE', 'READY_FOR_CONFIRMATION', 'RAM_AWAITING_OPERATOR_RECONNECT'},
                  'RAM restoration requires an active RAM-only phase')
         return
     if state == 'MANUALLY_RECONCILED_SAFE':
@@ -270,6 +275,10 @@ class InstallJournal:
                              'Explicit user approval is required')
                     _manual_reconciliation(event['details'].get('reconciliation_artifact'),
                                            event['binding'], events)
+                if event['state'] == 'LOCAL_REJECTED_BEFORE_DEVICE_ENTRY':
+                    from camera_local_rejection import validate_local_rejection
+                    validate_local_rejection(event['details'].get('local_rejection_artifact'),
+                                             event['binding'], events, folder, check_current_claims=False)
                 events.append(event)
             return cls(folder, events)
         except (OSError, TypeError, KeyError) as exc:
@@ -284,7 +293,22 @@ class InstallJournal:
         _require(state != 'CONTENT_VERIFIED', 'Use record_content_verified with an artifact')
         _require(state != 'MANUALLY_RECONCILED_SAFE', 'Use record_manual_reconciliation with explicit approval')
         _require(state != 'RAM_RESTORATION_VERIFIED', 'Use record_ram_restoration_verified with an artifact')
+        _require(state != 'LOCAL_REJECTED_BEFORE_DEVICE_ENTRY', 'Use record_local_rejection with an artifact')
         return self._append(state, {} if details is None else details)
+
+    def record_local_rejection(self, artifact_path):
+        """Close the pinned historical local failure; permit only a fresh session.
+
+        This records local execution evidence, without hardware assertions,
+        device actions, rollback, recovery, or permission to resume this attempt.
+        """
+        from camera_local_rejection import validate_local_rejection
+        path = Path(artifact_path).absolute()
+        raw, _ = _read_json(path)
+        reference = {'path': str(path), 'sha256': _sha(raw)}
+        validate_local_rejection(reference, self.binding, self._events, self.session_dir,
+                                 check_current_claims=True)
+        return self._append('LOCAL_REJECTED_BEFORE_DEVICE_ENTRY', {'local_rejection_artifact': reference})
 
     def record_content_verified(self, artifact_path):
         path = Path(artifact_path).absolute()
@@ -341,6 +365,10 @@ class InstallJournal:
         if state == 'MANUALLY_RECONCILED_SAFE':
             _require(details.get('explicit_user_approval') is True, 'Explicit user approval is required')
             _manual_reconciliation(details.get('reconciliation_artifact'), binding, self._events)
+        if state == 'LOCAL_REJECTED_BEFORE_DEVICE_ENTRY':
+            from camera_local_rejection import validate_local_rejection
+            validate_local_rejection(details.get('local_rejection_artifact'), binding,
+                                     self._events, self.session_dir, check_current_claims=True)
         event['event_sha256'] = _sha(_canonical(event))
         raw = _canonical(event)
         target = self.session_dir / f"{event['seq']:08d}.json"
