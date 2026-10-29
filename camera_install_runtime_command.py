@@ -5,7 +5,9 @@ No card activation, RAM patch, firmware start or restoration command exists.
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
+import sys
 import uuid
 
 from camera_device_lease import CameraDeviceLease
@@ -48,6 +50,11 @@ def assets_from_reference(reference):
     return RuntimeAssets(Path(reference['p1']['directory']), reference['p1']['manifest_sha256'], assets)
 
 
+def _host_access():
+    require(sys.platform != 'darwin' or os.geteuid() == 0,
+            'macOS MSC collection requires the reviewed command to run with sudo')
+
+
 def prepare_read(*, original_plan, original_plan_sha256, p1_directory, metadata_job, output):
     plan = _base_plan(original_plan, original_plan_sha256)
     p1_directory = _local(p1_directory, directory=True)
@@ -65,6 +72,7 @@ def run_read(*, original_plan, original_plan_sha256, review_path, review_sha256,
     require(read_authorized is True and camera_ready is True,
             'Explicit read-only authorization and connected normal MSC camera required')
     _source_only_runtime()
+    _host_access()
     plan = _base_plan(original_plan, original_plan_sha256)
     _, review = _json(_local(review_path))
     require(review.get('schema') == REVIEW_SCHEMA, 'Runtime-only review required')

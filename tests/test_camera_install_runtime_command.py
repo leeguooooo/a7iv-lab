@@ -26,6 +26,14 @@ class RuntimeCommandTests(unittest.TestCase):
                     read_authorized=True,camera_ready=True)
             plan.assert_not_called();lease.assert_not_called()
 
+    def test_missing_macos_usb_privilege_stops_before_plan_or_journal(self):
+        with patch.object(command,'_source_only_runtime'),patch.object(command.sys,'platform','darwin'),patch.object(command.os,'geteuid',return_value=501),patch.object(command,'_base_plan') as plan,patch.object(command,'CameraDeviceLease') as lease:
+            with self.assertRaisesRegex(ValueError,'sudo'):
+                command.run_read(original_plan=Path('/unused'),original_plan_sha256='a'*64,
+                    review_path=Path('/unused'),review_sha256='b'*64,evidence=Path('/unused'),
+                    read_authorized=True,camera_ready=True)
+            plan.assert_not_called();lease.assert_not_called()
+
     def test_reference_reconstruction_keeps_exact_native_asset_hashes(self):
         reference={'p1':{'directory':'/MODEL/p1','manifest_sha256':'a'*64},'metadata':{'job_dir':'/MODEL/meta',
             'manifest_sha256':'b'*64,'module_sha256':'c'*64,'native_model_sha256':'d'*64,'bootstrap_model_sha256':'e'*64}}
@@ -45,6 +53,7 @@ class RuntimeCommandTests(unittest.TestCase):
                 'manifest_sha256':'b'*64,'module_sha256':'c'*64,'native_model_sha256':'d'*64,'bootstrap_model_sha256':'e'*64}}
             review.write_text(json.dumps(dict(schema=command.REVIEW_SCHEMA,asset_reference=reference)))
             stack.enter_context(patch.object(command,'_source_only_runtime'))
+            stack.enter_context(patch.object(command,'_host_access'))
             preflight=stack.enter_context(patch.object(command,'preflight_assets',return_value=object()))
             validation=stack.enter_context(patch.object(command,'validate_review'))
             stack.enter_context(patch.object(command,'read_requirements',return_value={'required_partition_sizes':{'nflasha1':1}}))
