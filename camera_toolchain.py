@@ -25,7 +25,8 @@ TEST_MODULES=('test_camera_device_lease','test_camera_install_journal','test_cam
               'test_camera_capture_session','test_camera_operation_guard','test_camera_package_audit',
               'test_fl23_prewrite_guard','test_fl23_prewrite_adapter','test_camera_workflow',
               'test_camera_workflow_simulator','test_camera_local_rejection',
-              'test_camera_install_volatile')
+              'test_camera_install_volatile','test_camera_install_patch',
+              'test_camera_install_patch_session','test_camera_install_patch_plan')
 
 
 def require(ok,message):
@@ -162,7 +163,8 @@ def check(*,tests=False,install_volatile_job=None):
              'camera_capture_session.py','camera_menu_window.py','camera_menu_session.py',
              'camera_postinstall_verify.py','camera_backup_records.py','camera_package_audit.py',
              'camera_workflow.py','camera_workflow_spec.py','camera_workflow_simulator.py','camera-workflow',
-             'camera_install_volatile.py','native/install_volatile_patch.c')
+             'camera_install_volatile.py','native/install_volatile_patch.c',
+             'camera_install_patch.py','camera_install_patch_session.py','camera_install_patch_plan.py')
     sources={ROOT/p for p in runtime}
     sources|={ROOT/'tools'/n for n in ('menu_window_profile.py','build_menu_window_offline.py',
                 'verify_menu_window_offline.py','emulate_menu_window_offline.py',

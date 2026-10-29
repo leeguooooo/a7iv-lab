@@ -30,6 +30,7 @@ STATES = frozenset({
     'DEVICE_COMPLETION_REPORTED', 'CONTENT_VERIFIED', 'STOPPED_UNKNOWN',
     'CANCELLED_BEFORE_DEVICE_WRITE', 'MANUALLY_RECONCILED_SAFE', 'RAM_RESTORATION_VERIFIED',
     'LOCAL_REJECTED_BEFORE_DEVICE_ENTRY',
+    'INSTALL_PATCH_MAY_BE_ACTIVE', 'INSTALL_PATCH_AWAITING_OPERATOR_RECONNECT',
 })
 TERMINAL_SAFE = frozenset({'CONTENT_VERIFIED', 'CANCELLED_BEFORE_DEVICE_WRITE',
                            'MANUALLY_RECONCILED_SAFE', 'RAM_RESTORATION_VERIFIED',
@@ -37,7 +38,8 @@ TERMINAL_SAFE = frozenset({'CONTENT_VERIFIED', 'CANCELLED_BEFORE_DEVICE_WRITE',
 NEXT = {
     'PLANNED': {'SD_STAGE_INTENT'},
     'SD_STAGE_INTENT': {'SD_STAGED'},
-    'SD_STAGED': {'RAM_MAY_BE_ACTIVE', 'READY_FOR_CONFIRMATION'},
+    'SD_STAGED': {'RAM_MAY_BE_ACTIVE', 'READY_FOR_CONFIRMATION', 'INSTALL_PATCH_MAY_BE_ACTIVE'},
+    'INSTALL_PATCH_MAY_BE_ACTIVE': {'INSTALL_PATCH_AWAITING_OPERATOR_RECONNECT'},
     'RAM_MAY_BE_ACTIVE': {'READY_FOR_CONFIRMATION', 'RAM_AWAITING_OPERATOR_RECONNECT'},
     'READY_FOR_CONFIRMATION': {'FLASH_MAY_HAVE_STARTED'},
     'FLASH_MAY_HAVE_STARTED': {'DEVICE_COMPLETION_REPORTED'},
@@ -125,7 +127,9 @@ def _transition(history, state):
     if state == 'STOPPED_UNKNOWN':
         return
     if state == 'CANCELLED_BEFORE_DEVICE_WRITE':
-        _require(not any(e['state'] in {'RAM_MAY_BE_ACTIVE', 'FLASH_MAY_HAVE_STARTED'} for e in history),
+        _require(not any(e['state'] in {'RAM_MAY_BE_ACTIVE', 'FLASH_MAY_HAVE_STARTED',
+                                       'INSTALL_PATCH_MAY_BE_ACTIVE',
+                                       'INSTALL_PATCH_AWAITING_OPERATOR_RECONNECT'} for e in history),
                  'Cannot cancel after a possible device write')
         return
     _require(state in NEXT.get(previous, set()), 'Invalid phase transition: ' + previous + ' -> ' + str(state))
@@ -157,6 +161,22 @@ def _ram_restoration(reference, binding, history):
              'Both volatile RAM targets must be proven safe')
     _require(report.get('firmware_flash_was_never_started') is True,
              'RAM restoration requires proof flash was never started')
+    return report
+
+
+def _install_patch_pending(reference, binding, history):
+    from camera_install_patch_session import validate_pending_receipt
+    try:
+        return validate_pending_receipt(reference, binding, history)
+    except (ValueError, OSError, TypeError, KeyError) as error:
+        raise JournalError('Invalid install-patch pending receipt') from error
+
+
+def _install_patch_details(details, binding, history):
+    from camera_install_patch_session import canonical_sha256
+    report = _install_patch_pending(details.get('install_patch_artifact'), binding, history)
+    _require(details.get('complete_receipt_sha256') == canonical_sha256(report),
+             'Complete install-patch receipt payload changed')
     return report
 
 
@@ -270,6 +290,8 @@ class InstallJournal:
                 if event['state'] == 'RAM_RESTORATION_VERIFIED':
                     _ram_restoration(event['details'].get('ram_restoration_artifact'),
                                      event['binding'], events)
+                if event['state'] == 'INSTALL_PATCH_AWAITING_OPERATOR_RECONNECT':
+                    _install_patch_details(event['details'], event['binding'], events)
                 if event['state'] == 'MANUALLY_RECONCILED_SAFE':
                     _require(event['details'].get('explicit_user_approval') is True,
                              'Explicit user approval is required')
@@ -294,7 +316,21 @@ class InstallJournal:
         _require(state != 'MANUALLY_RECONCILED_SAFE', 'Use record_manual_reconciliation with explicit approval')
         _require(state != 'RAM_RESTORATION_VERIFIED', 'Use record_ram_restoration_verified with an artifact')
         _require(state != 'LOCAL_REJECTED_BEFORE_DEVICE_ENTRY', 'Use record_local_rejection with an artifact')
+        _require(state != 'INSTALL_PATCH_AWAITING_OPERATOR_RECONNECT',
+                 'Use record_install_patch_awaiting_reconnect with a complete artifact')
         return self._append(state, {} if details is None else details)
+
+    def record_install_patch_awaiting_reconnect(self, artifact_path):
+        """Record a complete preparation receipt while keeping all work blocked."""
+        path = Path(artifact_path).absolute()
+        from camera_install_patch_session import canonical_sha256
+        raw, report = _read_json(path)
+        reference = dict(path=str(path), sha256=_sha(raw))
+        _transition(self._events, 'INSTALL_PATCH_AWAITING_OPERATOR_RECONNECT')
+        _install_patch_pending(reference, self.binding, self._events)
+        return self._append('INSTALL_PATCH_AWAITING_OPERATOR_RECONNECT', dict(
+            install_patch_artifact=reference,
+            complete_receipt_sha256=canonical_sha256(report)))
 
     def record_local_rejection(self, artifact_path):
         """Close the pinned historical local failure; permit only a fresh session.
@@ -362,6 +398,8 @@ class InstallJournal:
             _verification(event['details'].get('verification_artifact'), binding)
         if state == 'RAM_RESTORATION_VERIFIED':
             _ram_restoration(details.get('ram_restoration_artifact'), binding, self._events)
+        if state == 'INSTALL_PATCH_AWAITING_OPERATOR_RECONNECT':
+            _install_patch_details(details, binding, self._events)
         if state == 'MANUALLY_RECONCILED_SAFE':
             _require(details.get('explicit_user_approval') is True, 'Explicit user approval is required')
             _manual_reconciliation(details.get('reconciliation_artifact'), binding, self._events)

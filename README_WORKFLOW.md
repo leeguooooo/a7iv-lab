@@ -45,3 +45,21 @@
 新模块使用 `M4IVP001/version2` 和独立 START 协议。成功时两处补丁有意保留，关闭两个内存句柄后发布终态并退出，不再计时恢复。提交边界前的失败保留原目标身份检查和反向恢复；提交后的关闭或发布异常仍可能留下补丁，不能重试或声称已恢复。最终记录先写入并关闭临时文件，再以 `RENAME_NOREPLACE` 发布，关闭或重命名失败不能产生新的成功终态。
 
 主机验证器只核对三份回执的字节、身份和状态一致性，不证明它们来自真实设备。`VOLATILE_PATCH_APPLIED_NOT_RESTORED` 不等于 RAM 恢复、菜单接纳或安装成功。工具链检查同时核对完整 worker 与 bootstrap 模型及其源码、产物、nonce 绑定，仍保持 `installation_authorized=false`。真实 Linux 调用、缓存一致性、进程切换、正式安装交接和取消流程尚待验证，现有演练入口继续使用原协议。
+
+## 主机准备会话与计划封存
+
+`run_install_patch_session` 提供独立的准备会话接口，没有接入设备 CLI。它只接受易失补丁准备许可，并要求明确知晓补丁不会计时恢复；这不是固件安装许可。真实入口要求全局 journal、规范设备 lease，以及 `-B -E -s -X pycache_prefix="$PWD/output/workflow-absent-bytecode-cache"` 启动参数，该缓存目录必须不存在。
+
+认证前先校验计划、源码快照、原生模块和全部 nonce，再记录 `INSTALL_PATCH_MAY_BE_ACTIVE` 并预留一次性任务。完整回执先落盘，成功路径才允许原正常会话辅助函数执行 STOP。已知退出后只记录 `INSTALL_PATCH_AWAITING_OPERATOR_RECONNECT`。该状态仍阻断协作工具的其他操作，不通往 READY、FLASH、旧演练恢复或取消。未知认证、START、回执或 STOP 结果都不会自动重试、恢复或重启。
+
+封存新计划前，需要两份未使用的原库采集任务。以下命令均为离线构建和本地封存，不会预占硬件 nonce，也不会连接设备：
+
+```sh
+.venv-offline/bin/python -B -E -s tools/build_firmware_file_capture_offline.py --target pre_app --output output/install-patch-captures-01/pre_app --bundle
+.venv-offline/bin/python -B -E -s tools/build_firmware_file_capture_offline.py --target pre_ufp --output output/install-patch-captures-01/pre_ufp --bundle
+.venv-offline/bin/python -B -E -s camera_install_patch_plan.py --output output/install-patch-plan-01 --patch-job output/install-volatile-review-01 --capture-assets output/install-patch-captures-01 --body-reference output/backup-01/execution/run.json
+```
+
+计划绑定本地源码、SDK Python 文件、快照、模块与采集任务哈希，以及历史机身参考记录。它不证明相机当前在线或满足现场条件，也不授予执行许可。源文件、快照或参考记录变化后，入口会在认证前拒绝旧计划。计划目录必须是新目录，旧文件不会覆盖。
+
+重连后仍需新的当前状态证据或明确的刷写前菜单验收。保存的补丁终态和同机 MSC 重现，不能证明补丁此刻仍有效。补丁后的安全取消与正式更新入口尚未实现，不能靠时间、PID 消失或一次电源拨动清除审计记录。

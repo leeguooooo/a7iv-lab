@@ -351,6 +351,35 @@ class JournalTests(unittest.TestCase):
         path.write_text(json.dumps(report))
         return path, report
 
+    def test_install_patch_may_cannot_cancel_flash_ready_or_old_restore(self):
+        for phase in ('SD_STAGE_INTENT', 'SD_STAGED', 'INSTALL_PATCH_MAY_BE_ACTIVE'):
+            self.journal.advance(phase)
+        for state in ('READY_FOR_CONFIRMATION', 'FLASH_MAY_HAVE_STARTED',
+                      'CANCELLED_BEFORE_DEVICE_WRITE', 'RAM_MAY_BE_ACTIVE',
+                      'RAM_AWAITING_OPERATOR_RECONNECT', 'RAM_RESTORATION_VERIFIED',
+                      'INSTALL_PATCH_AWAITING_OPERATOR_RECONNECT'):
+            with self.subTest(state=state), self.assertRaises(ledger.JournalError):
+                self.journal.advance(state)
+        artifact = self.host / 'old-restore.json'
+        artifact.write_text(json.dumps(dict(self.binding, source_is_hardware=True, all_passed=True,
+            scope='VOLATILE_RAM_WINDOW_ONLY', both_RAM_targets_proven_safe=True,
+            firmware_flash_was_never_started=True)))
+        with self.assertRaises(ledger.JournalError):
+            self.journal.record_ram_restoration_verified(artifact)
+        self.assert_blocked()
+
+    def test_install_patch_pending_requires_complete_artifact_endpoint(self):
+        for phase in ('SD_STAGE_INTENT', 'SD_STAGED', 'INSTALL_PATCH_MAY_BE_ACTIVE'):
+            self.journal.advance(phase)
+        artifact = self.host / 'counterfeit-pending.json'
+        artifact.write_text(json.dumps(dict(self.binding,
+            state='INSTALL_PATCH_AWAITING_OPERATOR_RECONNECT', all_passed=True,
+            source_is_hardware=True, service_exit_completed=True)))
+        with self.assertRaises(ledger.JournalError):
+            self.journal.record_install_patch_awaiting_reconnect(artifact)
+        self.assertEqual(self.journal.state, 'INSTALL_PATCH_MAY_BE_ACTIVE')
+        self.assert_blocked()
+
     def test_operator_reconnect_pending_blocks_new_work_cancel_and_flash(self):
         artifact, _ = self.ram_report()
         self.journal.advance('RAM_AWAITING_OPERATOR_RECONNECT')
