@@ -28,7 +28,8 @@ TEST_MODULES=('test_camera_device_lease','test_camera_install_journal','test_cam
               'test_camera_install_volatile','test_camera_install_patch',
               'test_camera_install_patch_session','test_camera_install_patch_plan',
               'test_camera_install_patch_read','test_camera_install_cancel',
-              'test_camera_install_patch_read_execution')
+              'test_camera_install_patch_read_execution','test_camera_install_patch_read_session',
+              'test_camera_install_card','test_camera_install_runtime')
 
 
 def require(ok,message):
@@ -248,7 +249,8 @@ def check(*,tests=False,install_volatile_job=None,install_patch_read_job=None):
              'camera_install_volatile.py','native/install_volatile_patch.c',
              'camera_install_patch.py','camera_install_patch_session.py','camera_install_patch_plan.py',
              'camera_install_patch_read.py','camera_install_cancel.py','native/install_patch_read.c',
-             'camera_install_patch_read_execution.py')
+             'camera_install_patch_read_execution.py','camera_install_patch_read_session.py',
+             'camera_install_patch_read_plan.py','camera_install_card.py','camera_install_runtime.py')
     sources={ROOT/p for p in runtime}
     sources|={ROOT/'tools'/n for n in ('menu_window_profile.py','build_menu_window_offline.py',
                 'verify_menu_window_offline.py','emulate_menu_window_offline.py',
@@ -283,7 +285,7 @@ def check(*,tests=False,install_volatile_job=None,install_patch_read_job=None):
         'full_SDK_atomic_or_automatic_rollback_proven':False,
         'still_required':([
             'Separate authorized install host/journal, cancellation and menu handoff implementation',
-            'Authenticated current-read session wiring and hardware-backed cancellation',
+            'Current-read hardware session validation and hardware-backed cancellation',
             'Fresh same-body admission and explicit reviewed recovery disposition',
             'Actual process/cache/syscall and update lifecycle validation',
             'Postinstall captures/settings and FL2/FL3 photo/video acceptance',
