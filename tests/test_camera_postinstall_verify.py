@@ -79,6 +79,9 @@ def fat_image(initrd, kernel, dat2=b'MODL', dat3=b'REGN'):
     entry(1120, b'DAT3       ', 7, dat3)
     entry(2048, b'INITRD  IMG', 3, initrd)
     entry(2080, b'VMLINUX BIN', 4, kernel)
+    entry(2112, b'CXD90057DTB', 8, b'fixture-device-tree')
+    entry(2144, b'KEMCO   TXT', 9, b'fixture-boot-config')
+    entry(2176, b'LOADADDRTXT', 10, b'fixture-load-address')
     return bytes(raw)
 
 
@@ -103,6 +106,9 @@ class PostinstallTests(unittest.TestCase):
             member = tarfile.TarInfo(verify.TEMPLATE)
             member.size = len(self.template)
             tar.addfile(member, io.BytesIO(self.template))
+            member = tarfile.TarInfo(verify.UPDATER_P1)
+            member.size = len(self.p1)
+            tar.addfile(member, io.BytesIO(self.p1))
         payload = archive.getvalue()
         header = bytearray(512)
         header[:8], header[36:40], header[40:44] = b'UDTRFIRM', b'MODL', b'REGN'
@@ -295,6 +301,21 @@ class PostinstallTests(unittest.TestCase):
                 self.make_capture('post_p1', raw, '04' * 16)
                 self.save_run()
                 self.rejected()
+
+    def test_p1_device_tree_and_boot_configuration_must_match_package(self):
+        import shutil
+        fs = verify._fat(self.p1)
+        for name in verify.BOOT_FILES:
+            with self.subTest(file=name):
+                raw = bytearray(self.p1)
+                raw[fs.offset(fs.locate(name)[1])] ^= 1
+                shutil.rmtree(self.group / 'post_p1')
+                self.make_capture('post_p1', bytes(raw), '04' * 16)
+                self.save_run()
+                result = self.call()
+                self.assertFalse(result['all_passed'])
+                self.assertIn('P1 device-tree or boot configuration mismatch',
+                              result['pending'][0]['reason'])
 
     def test_critical_condition_slots_colour_attrs_and_structure_rejected(self):
         mutations = [dict(self.values, **{}) for _ in range(4)]

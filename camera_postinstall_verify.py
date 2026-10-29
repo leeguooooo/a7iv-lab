@@ -27,6 +27,8 @@ PLAIN_SHA = 'ebc7f537c21b685609f646670ab8b381db15d7283d259cbb587a2c0a008a51bf'
 FACTORY_SHA = 'd415c4766c62b5b63bf106306e67b6a0512c4f97db834378e47ef79c40cf580b'
 INITRD_SHA = '89d798faa7b57b9d06e04b6430635ff1c048d878d6f96fd498147aa5a822e203'
 TEMPLATE = '0110_backup/SYSIPSX-DSLR/LS/CH89101_CN1.bin'
+UPDATER_P1 = '0400_updater/dev/nflasha1'
+BOOT_FILES = ('boot/CXD90057.DTB', 'boot/KEMCO.TXT', 'boot/LOADADDR.TXT')
 PROFILES = {
     'post_app': (98212632, 'd17e61fb4ba193d8e7d802196edff5f578d5691b3fcc4abcd1cbbb6e58bdd8ff', '/usr/lib/appFw.so', 'REGULAR'),
     'post_cp': (16236816, '4551c73386c27a0a9b247fd3e05c3bd5e3425bdb9fe9f8374c201c96533b3479', '/cp/cpapp-b.bin', 'REGULAR'),
@@ -121,22 +123,25 @@ def _reference_inputs(plain_path, factory_path):
         start, length = struct.unpack_from('<II', header, 48)
         require(start >= 512 and start + length == plain.stat().st_size, 'New package archive bounds')
         stream.seek(start)
-        templates = []
+        members = {TEMPLATE: [], UPDATER_P1: []}
         with tarfile.open(fileobj=stream, mode='r|') as archive:
             for member in archive:
                 name = member.name.removeprefix('./')
                 require(not name.startswith('/') and '..' not in Path(name).parts, 'Unsafe archive member')
                 require(member.offset_data + member.size <= length, 'Archive member outside package')
-                if name == TEMPLATE:
+                if name in members:
                     require(member.isfile(), 'Selected template is not a regular member')
-                    templates.append(archive.extractfile(member).read())
-        require(len(templates) == 1, 'Missing/duplicate selected CH89101_CN1 template')
+                    members[name].append(archive.extractfile(member).read())
+        require(all(len(values) == 1 for values in members.values()),
+                'Missing/duplicate selected settings template or updater P1')
         stream.seek(0)
         require(hashlib.file_digest(stream, 'sha256').hexdigest() == PLAIN_SHA,
                 'Pinned plaintext changed during verification')
     factory_raw = factory.read_bytes()
     require(sha(factory_raw) == FACTORY_SHA, 'Pinned factory P1 SHA mismatch')
-    return header, templates[0], _fat(factory_raw).read('boot/vmlinux.bin'), (plain, factory)
+    package_p1 = _fat(members[UPDATER_P1][0])
+    boot_files = {name: package_p1.read(name) for name in BOOT_FILES}
+    return header, members[TEMPLATE][0], _fat(factory_raw).read('boot/vmlinux.bin'), boot_files
 
 
 def _capture(root, profile, report_relative, report_sha256, binding, group_nonce, source, seen, forbidden):
@@ -260,7 +265,7 @@ def verify_capture_run(run_path, *, plan_sha256, body_sha256, model, group_nonce
             location = _regular(candidate)
             metadata = location.stat()
             forbidden.add((metadata.st_dev, metadata.st_ino))
-        header, template, factory_kernel, _ = _reference_inputs(plain_path, factory_p1_path)
+        header, template, factory_kernel, boot_files = _reference_inputs(plain_path, factory_p1_path)
         result['checks']['pinned_package_and_factory'] = True
         seen, captures = {group_nonce}, {}
         # The mandatory group references bind each immutable report digest to
@@ -285,6 +290,9 @@ def verify_capture_run(run_path, *, plan_sha256, body_sha256, model, group_nonce
         require(p1.read('P1CHKSUM') == expected_sum, 'P1CHKSUM mismatch')
         require(p1.read('DAT2') == header[36:40] and p1.read('DAT3') == header[40:44],
                 'P1 DAT2/DAT3 model/region mismatch')
+        require(all(p1.read(name) == expected for name, expected in boot_files.items()),
+                'P1 device-tree or boot configuration mismatch')
+        result['checks']['p1_boot_files'] = {name: sha(raw) for name, raw in boot_files.items()}
         result['checks']['p1_semantics'] = True
         result['checks']['critical_settings'] = _critical_settings(
             root, run['critical_settings'], binding, group_nonce, source_is_hardware, seen, forbidden, template)

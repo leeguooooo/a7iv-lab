@@ -27,7 +27,8 @@ TEST_MODULES=('test_camera_device_lease','test_camera_install_journal','test_cam
               'test_camera_workflow_simulator','test_camera_local_rejection',
               'test_camera_install_volatile','test_camera_install_patch',
               'test_camera_install_patch_session','test_camera_install_patch_plan',
-              'test_camera_install_patch_read','test_camera_install_cancel')
+              'test_camera_install_patch_read','test_camera_install_cancel',
+              'test_camera_install_patch_read_execution')
 
 
 def require(ok,message):
@@ -246,7 +247,8 @@ def check(*,tests=False,install_volatile_job=None,install_patch_read_job=None):
              'camera_workflow.py','camera_workflow_spec.py','camera_workflow_simulator.py','camera-workflow',
              'camera_install_volatile.py','native/install_volatile_patch.c',
              'camera_install_patch.py','camera_install_patch_session.py','camera_install_patch_plan.py',
-             'camera_install_patch_read.py','camera_install_cancel.py','native/install_patch_read.c')
+             'camera_install_patch_read.py','camera_install_cancel.py','native/install_patch_read.c',
+             'camera_install_patch_read_execution.py')
     sources={ROOT/p for p in runtime}
     sources|={ROOT/'tools'/n for n in ('menu_window_profile.py','build_menu_window_offline.py',
                 'verify_menu_window_offline.py','emulate_menu_window_offline.py',
@@ -281,10 +283,10 @@ def check(*,tests=False,install_volatile_job=None,install_patch_read_job=None):
         'full_SDK_atomic_or_automatic_rollback_proven':False,
         'still_required':([
             'Separate authorized install host/journal, cancellation and menu handoff implementation',
-            'Authenticated current-read integration and hardware-backed cancellation',
+            'Authenticated current-read session wiring and hardware-backed cancellation',
             'Fresh same-body admission and explicit reviewed recovery disposition',
             'Actual process/cache/syscall and update lifecycle validation',
-            'P1 nwu branches, postinstall captures/settings and FL2/FL3 photo/video acceptance',
+            'Postinstall captures/settings and FL2/FL3 photo/video acceptance',
             'Arbitrary true cube and sound remain separate unimplemented features'] if install_volatile or read_component else [
             'Controlled Mac/device session and RAM-window/handoff/restoration rehearsal',
             'Fresh same-body acquisition and critical-settings evidence from actual installation',
