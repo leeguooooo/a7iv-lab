@@ -29,7 +29,9 @@ TEST_MODULES=('test_camera_device_lease','test_camera_install_journal','test_cam
               'test_camera_install_patch_session','test_camera_install_patch_plan',
               'test_camera_install_patch_read','test_camera_install_cancel',
               'test_camera_install_patch_read_execution','test_camera_install_patch_read_session',
-              'test_camera_install_card','test_camera_install_runtime')
+              'test_camera_install_card','test_camera_install_runtime',
+              'test_camera_install_runtime_metadata','test_camera_install_runtime_session',
+              'test_camera_install_requirements','test_camera_install_runtime_command')
 
 
 def require(ok,message):
@@ -198,7 +200,21 @@ def checked_install_patch_read(job, existing_nonces=()):
         component_scope='INDEPENDENT_CURRENT_READ_MODEL_NOT_A_SESSION_PLAN')
 
 
-def check(*,tests=False,install_volatile_job=None,install_patch_read_job=None):
+def checked_runtime_metadata(job):
+    from camera_install_runtime_metadata import MetadataAssets, preflight_assets
+    from tools.emulate_install_runtime_metadata_offline import CASES, BOOTSTRAP_CASES
+    job=Path(job).absolute()
+    require(job.is_relative_to(ROOT/'output') and job.is_dir()
+            and all(not p.is_symlink() for p in (job,*job.parents)),
+            'Runtime metadata job must be a regular workspace output directory')
+    assets=MetadataAssets(job,*(sha(job/name) for name in
+        ('manifest.json','libJit.so','native-model-report.json','bootstrap-model-report.json')))
+    prepared=preflight_assets(assets)
+    return dict(prepared.reference,native_cases=len(CASES),bootstrap_cases=len(BOOTSTRAP_CASES),
+                offline_only=True,hardware_operations=0,write_admission=False)
+
+
+def check(*,tests=False,install_volatile_job=None,install_patch_read_job=None,runtime_metadata_job=None):
     from camera_package_audit import audit_candidate
     from camera_menu_window import checked_job,JOB
     from camera_firmware_capture import checked_capture_assets,JOBS,ASSETS,CLAIMS
@@ -239,6 +255,8 @@ def check(*,tests=False,install_volatile_job=None,install_patch_read_job=None):
     read_component=(checked_install_patch_read(install_patch_read_job,
         nonces+([install_volatile['nonce']] if install_volatile else []))
         if install_patch_read_job is not None else None)
+    runtime_metadata=(checked_runtime_metadata(runtime_metadata_job)
+                      if runtime_metadata_job is not None else None)
     reserved={'menu':(JOB/'physical-attempt.json').exists()}
     reserved.update({name:(CLAIMS/(v['nonce'].hex()+'.json')).exists() for name,v in captures.items()})
     runtime=('camera_toolchain.py','camera_device_lease.py','camera_operation_guard.py',
@@ -250,7 +268,10 @@ def check(*,tests=False,install_volatile_job=None,install_patch_read_job=None):
              'camera_install_patch.py','camera_install_patch_session.py','camera_install_patch_plan.py',
              'camera_install_patch_read.py','camera_install_cancel.py','native/install_patch_read.c',
              'camera_install_patch_read_execution.py','camera_install_patch_read_session.py',
-             'camera_install_patch_read_plan.py','camera_install_card.py','camera_install_runtime.py')
+             'camera_install_patch_read_plan.py','camera_install_card.py','camera_install_runtime.py',
+             'camera_install_runtime_metadata.py','camera_install_runtime_session.py',
+             'camera_install_runtime_plan.py','camera_install_runtime_command.py','camera_install_requirements.py',
+             'native/install_runtime_metadata.c')
     sources={ROOT/p for p in runtime}
     sources|={ROOT/'tools'/n for n in ('menu_window_profile.py','build_menu_window_offline.py',
                 'verify_menu_window_offline.py','emulate_menu_window_offline.py',
@@ -258,11 +279,13 @@ def check(*,tests=False,install_volatile_job=None,install_patch_read_job=None):
     sources|=set((ROOT/'tools').glob('*firmware_file_capture*.py'))
     sources|=set((ROOT/'tools').glob('*install_volatile*.py'))
     sources|=set((ROOT/'tools').glob('*install_patch_read*.py'))
+    sources|=set((ROOT/'tools').glob('*install_runtime_metadata*.py'))
     sources|=set((ROOT/'tests').glob('test_camera_*.py'))
     sources|=set((ROOT/'tests').glob('test_fl23_prewrite_*.py'))
     sources|=set(ROOT.glob('camera_stream*.py'))
     sources|={ROOT/'camera_inventory.py',ROOT/'ref/sony-a7m4-custom-firmware/a7m4/fat.py',
-              ROOT/'ref/sony-a7m4-custom-firmware/a7m4/common.py'}
+              ROOT/'ref/sony-a7m4-custom-firmware/a7m4/common.py',
+              ROOT/'ref/sony-a7m4-custom-firmware/a7m4/__init__.py'}
     test_count=None
     source_hashes={str(p.relative_to(ROOT)):sha(p) for p in sorted(sources)}
     if tests:
@@ -282,6 +305,7 @@ def check(*,tests=False,install_volatile_job=None,install_patch_read_job=None):
         'installation_authorized':False,'hardware_acceptance_proven':False,
         'install_volatile':install_volatile,
         'install_patch_read':read_component,
+        'runtime_metadata':runtime_metadata,
         'full_SDK_atomic_or_automatic_rollback_proven':False,
         'still_required':([
             'Separate authorized install host/journal, cancellation and menu handoff implementation',
