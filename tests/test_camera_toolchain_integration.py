@@ -4,6 +4,8 @@ import contextlib
 import io
 from pathlib import Path
 import tempfile
+import subprocess
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -16,6 +18,17 @@ from test_camera_menu_window import SyntheticMenu
 
 
 class IntegrationTests(unittest.TestCase):
+    def test_current_read_component_cannot_be_sealed_as_a_rehearsal_plan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / 'must-not-exist.json'
+            result = subprocess.run([sys.executable, '-B', '-E', '-s',
+                str(Path(__file__).resolve().parents[1] / 'camera_toolchain.py'),
+                'prepare', '--install-patch-read-job', directory, '--report', str(report)],
+                capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('offline check only, not a session plan', result.stderr)
+            self.assertFalse(report.exists())
+
     @classmethod
     def setUpClass(cls):cls.meta,cls.module=menu.checked_job()
 

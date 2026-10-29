@@ -26,7 +26,8 @@ TEST_MODULES=('test_camera_device_lease','test_camera_install_journal','test_cam
               'test_fl23_prewrite_guard','test_fl23_prewrite_adapter','test_camera_workflow',
               'test_camera_workflow_simulator','test_camera_local_rejection',
               'test_camera_install_volatile','test_camera_install_patch',
-              'test_camera_install_patch_session','test_camera_install_patch_plan')
+              'test_camera_install_patch_session','test_camera_install_patch_plan',
+              'test_camera_install_patch_read','test_camera_install_cancel')
 
 
 def require(ok,message):
@@ -118,7 +119,84 @@ def checked_install_volatile(job, existing_nonces=()):
         runtime_executor_created=False,workflow_unlocked=False,success_is_RAM_restoration=False)
 
 
-def check(*,tests=False,install_volatile_job=None):
+def checked_install_patch_read(job, existing_nonces=()):
+    from camera_install_patch_read import spec_sha256
+    from tools.verify_install_patch_read_offline import verify
+    from tools.emulate_install_patch_read_offline import CASES, READ_BOOTSTRAP_CASES
+    from tools.model_toolchain_bootstraps_offline import PINS
+    job=Path(job).absolute()
+    require(job.resolve().is_relative_to(ROOT/'output')
+            and all(not p.is_symlink() for p in (job,*job.parents)),
+            'Read assets must be a regular workspace output directory')
+    require(all((job/name).is_file() and not (job/name).is_symlink()
+                for name in ('manifest.json','verification.json','target-spec.json',
+                             'native-model-report.json','bootstrap-model-report.json')),
+            'Regular current-read evidence files required')
+    verify(job)
+    manifest=read(job/'manifest.json');spec=read(job/'target-spec.json')
+    require(manifest['nonce'] not in existing_nonces,'Current-read nonce reused across tools')
+    model=read(job/'native-model-report.json')
+    require(model.get('all_passed') is True
+            and model.get('coverage_complete_for_declared_matrix') is True
+            and model.get('case_count')==len(CASES) and len(model.get('cases',()))==len(CASES)
+            and {c.get('case') for c in model['cases']}==set(CASES)
+            and all(c.get('passed') is True and c.get('actual_native_instruction_execution') is True
+                    and c.get('process_memory_writes')==0 and c.get('all_memory_opens_readonly') is True
+                    and c.get('hardware_operations')==0 for c in model['cases']),
+            'Complete readonly native fault matrix required')
+    require(model.get('manifest_sha256')==sha(job/'manifest.json')
+            and model.get('verification_sha256')==sha(job/'verification.json')
+            and model.get('debug_worker_sha256')==sha(job/'worker.debug.elf')
+            and model.get('emulator_sha256')==sha(ROOT/'tools/emulate_install_patch_read_offline.py')
+            and model.get('contract_sha256')==sha(ROOT/'camera_install_patch_read.py')
+            and model.get('profile_sha256')==sha(ROOT/'tools/install_patch_read_profile.py')
+            and model.get('verifier_sha256')==sha(ROOT/'tools/verify_install_patch_read_offline.py')
+            and model.get('source_bindings')==manifest['sources']
+            and model.get('artifact_bindings')==manifest['artifacts'], 'Current-read model bindings changed')
+    require(model.get('process_memory_writes')==0 and model.get('all_memory_opens_readonly') is True
+            and model.get('hardware_operations')==0 and model.get('real_ARM_process_executed') is False
+            and model.get('bootstrap_executed') is False and model.get('runtime_executor_created') is False
+            and model.get('workflow_unlocked') is False and model.get('restoration_proven') is False
+            and model.get('original_mm_continuity_proven') is False
+            and model.get('installation_authorized') is False
+            and model.get('execution_kind')=='EMULATED_INSTRUCTIONS_ONLY'
+            and model.get('admission')=='OFFLINE_NOT_BODY_BOUND', 'Readonly model scope changed')
+    bootstrap=read(job/'bootstrap-model-report.json')
+    require(bootstrap.get('all_passed') is True
+            and bootstrap.get('coverage_complete_for_declared_matrix') is True
+            and set(bootstrap.get('declared_cases',()))==set(READ_BOOTSTRAP_CASES)
+            and bootstrap.get('case_count')==len(READ_BOOTSTRAP_CASES)
+            and len(bootstrap.get('cases',()))==len(READ_BOOTSTRAP_CASES)
+            and {c.get('scenario') for c in bootstrap['cases']}==set(READ_BOOTSTRAP_CASES)
+            and all(c.get('passed') is True for c in bootstrap['cases'])
+            and bootstrap.get('original_inputs_unchanged') is True
+            and bootstrap.get('bootstrap_CPU_emulated') is True
+            and bootstrap.get('worker_executed') is False
+            and bootstrap.get('real_ARM_process_executed') is False
+            and bootstrap.get('hardware_operations')==0, 'Complete current-read bootstrap matrix required')
+    require(bootstrap.get('input_hashes')=={name:sha(job/name) for name in
+                ('manifest.json','verification.json','libJit.so','worker.elf')}
+            and bootstrap.get('pinned_source_and_model_hashes')==PINS
+            and all(sha(ROOT/name)==digest for name,digest in PINS.items())
+            and bootstrap.get('adapter_helper_sha256')==sha(ROOT/'tools/model_toolchain_bootstraps_offline.py')
+            and bootstrap.get('engine_reference_sha256')==sha(ROOT/'tools/emulate_stream_bootstrap.py')
+            and bootstrap.get('runner_sha256')==sha(ROOT/'tools/emulate_install_patch_read_offline.py'),
+            'Current-read bootstrap bindings changed')
+    return dict(job=str(job.relative_to(ROOT)),nonce=manifest['nonce'],
+        manifest_sha256=sha(job/'manifest.json'),module_sha256=sha(job/'libJit.so'),
+        target_spec_sha256=spec_sha256(spec),target_spec_file_sha256=sha(job/'target-spec.json'),
+        prior_pending_sha256=spec['pending_receipt_sha256'],
+        derived_body_sha256=spec['body_sha256'],derived_plan_sha256=spec['plan_sha256'],
+        native_model_sha256=sha(job/'native-model-report.json'),native_cases=len(CASES),
+        bootstrap_model_sha256=sha(job/'bootstrap-model-report.json'),bootstrap_cases=len(READ_BOOTSTRAP_CASES),
+        original_source_declaration=spec['original_source_is_hardware'],
+        original_hardware_origin_proven=False,current_observation_is_hardware=False,
+        SDK_executor_created=False,cancellation_recorded=False,journal_cleared=False,
+        ready_for_confirmation=False,installation_authorized=False,offline_only=True,
+        component_scope='INDEPENDENT_CURRENT_READ_MODEL_NOT_A_SESSION_PLAN')
+
+
+def check(*,tests=False,install_volatile_job=None,install_patch_read_job=None):
     from camera_package_audit import audit_candidate
     from camera_menu_window import checked_job,JOB
     from camera_firmware_capture import checked_capture_assets,JOBS,ASSETS,CLAIMS
@@ -156,6 +234,9 @@ def check(*,tests=False,install_volatile_job=None):
     require(len(set(nonces))==len(nonces),'Runtime nonce reuse across tools')
     install_volatile=(checked_install_volatile(install_volatile_job,nonces)
                       if install_volatile_job is not None else None)
+    read_component=(checked_install_patch_read(install_patch_read_job,
+        nonces+([install_volatile['nonce']] if install_volatile else []))
+        if install_patch_read_job is not None else None)
     reserved={'menu':(JOB/'physical-attempt.json').exists()}
     reserved.update({name:(CLAIMS/(v['nonce'].hex()+'.json')).exists() for name,v in captures.items()})
     runtime=('camera_toolchain.py','camera_device_lease.py','camera_operation_guard.py',
@@ -164,13 +245,15 @@ def check(*,tests=False,install_volatile_job=None):
              'camera_postinstall_verify.py','camera_backup_records.py','camera_package_audit.py',
              'camera_workflow.py','camera_workflow_spec.py','camera_workflow_simulator.py','camera-workflow',
              'camera_install_volatile.py','native/install_volatile_patch.c',
-             'camera_install_patch.py','camera_install_patch_session.py','camera_install_patch_plan.py')
+             'camera_install_patch.py','camera_install_patch_session.py','camera_install_patch_plan.py',
+             'camera_install_patch_read.py','camera_install_cancel.py','native/install_patch_read.c')
     sources={ROOT/p for p in runtime}
     sources|={ROOT/'tools'/n for n in ('menu_window_profile.py','build_menu_window_offline.py',
                 'verify_menu_window_offline.py','emulate_menu_window_offline.py',
                 'model_toolchain_bootstraps_offline.py','fl23_prewrite_guard.py','fl23_prewrite_adapter.py')}
     sources|=set((ROOT/'tools').glob('*firmware_file_capture*.py'))
     sources|=set((ROOT/'tools').glob('*install_volatile*.py'))
+    sources|=set((ROOT/'tools').glob('*install_patch_read*.py'))
     sources|=set((ROOT/'tests').glob('test_camera_*.py'))
     sources|=set((ROOT/'tests').glob('test_fl23_prewrite_*.py'))
     sources|=set(ROOT.glob('camera_stream*.py'))
@@ -194,13 +277,15 @@ def check(*,tests=False,install_volatile_job=None):
         'CRC_rows_recomputed_from_actual_plaintext':True,
         'installation_authorized':False,'hardware_acceptance_proven':False,
         'install_volatile':install_volatile,
+        'install_patch_read':read_component,
         'full_SDK_atomic_or_automatic_rollback_proven':False,
         'still_required':([
             'Separate authorized install host/journal, cancellation and menu handoff implementation',
+            'Authenticated current-read integration and hardware-backed cancellation',
             'Fresh same-body admission and explicit reviewed recovery disposition',
             'Actual process/cache/syscall and update lifecycle validation',
             'P1 nwu branches, postinstall captures/settings and FL2/FL3 photo/video acceptance',
-            'Arbitrary true cube and sound remain separate unimplemented features'] if install_volatile else [
+            'Arbitrary true cube and sound remain separate unimplemented features'] if install_volatile or read_component else [
             'Controlled Mac/device session and RAM-window/handoff/restoration rehearsal',
             'Fresh same-body acquisition and critical-settings evidence from actual installation',
             'Actual FL2/FL3 photo/video tests; arbitrary true cube and sound remain separate unimplemented features']),
@@ -231,12 +316,15 @@ if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('action',choices=('check','prepare'));p.add_argument('--tests',action='store_true')
     p.add_argument('--report',type=Path)
-    p.add_argument('--install-volatile-job',type=Path);args=p.parse_args()
+    p.add_argument('--install-volatile-job',type=Path)
+    p.add_argument('--install-patch-read-job',type=Path);args=p.parse_args()
     if args.action=='prepare':
+        require(args.install_patch_read_job is None,'Current-read jobs support offline check only, not a session plan')
         require(args.report is not None,'Explicit new local plan file required')
         r=prepare(args.report,install_volatile_job=args.install_volatile_job)
     else:
-        r=check(tests=args.tests,install_volatile_job=args.install_volatile_job)
+        r=check(tests=args.tests,install_volatile_job=args.install_volatile_job,
+                install_patch_read_job=args.install_patch_read_job)
         if args.report:save(args.report,r)
     print(json.dumps({'local_checks_passed':True,'host_tests_run':r['host_tests_run'],
                       'hardware_operations_by_this_action':0,'installation_authorized':False}))
