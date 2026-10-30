@@ -316,7 +316,8 @@ class CaptureTests(unittest.TestCase):
         stack = ExitStack()
         self.addCleanup(stack.close)
         for name, value in (('NONCE', 'a' * 32), ('FREEZE_SHA256', '1' * 64),
-                            ('WORKER_SHA256', '2' * 64), ('MODULE_SHA256', '3' * 64)):
+                            ('WORKER_SHA256', '2' * 64), ('MODULE_SHA256', '3' * 64),
+                            ('EXPECTED_WRITES', ('future-profile-write-declarations',))):
             stack.enter_context(patch.object(ro, name, value))
         stack.enter_context(patch.object(ro, 'host_source_bindings', return_value={'new-source.py': '4' * 64}))
         return stack
@@ -329,6 +330,18 @@ class CaptureTests(unittest.TestCase):
         fresh = InstallJournal.create(self.root / 'sessions', 'fresh-profile',
                     plan_sha256='c' * 64, body_sha256='d' * 64, model='synthetic-new-profile')
         self.assertEqual(fresh.state, 'PLANNED')
+
+    def test_frozen_approval_replay_survives_current_write_policy_drift(self):
+        self.invoke()
+        with patch.object(ro, 'EXPECTED_WRITES', ('new current profile write policy',)):
+            self.assertEqual(InstallJournal.open(self.journal.session_dir).state, ro.OBSERVED)
+            assert_operation_allowed(sessions_root=self.root / 'sessions')
+        changed = json.loads(json.dumps(self.approval))
+        changed['binding']['expected_writes'] = ['new current profile write policy']
+        with patch.object(ro, 'EXPECTED_WRITES', tuple(changed['binding']['expected_writes'])):
+            with self.assertRaisesRegex(ValueError, 'Historical v1 approval'):
+                ro.validate_historical_approval_v1(changed, self.prepared.reference,
+                                                  self.reservation['record']['context'])
 
     def test_unknown_still_blocks_after_profile_and_source_drift(self):
         self.channel.fault = 'upload'
@@ -412,13 +425,14 @@ class CaptureTests(unittest.TestCase):
             self.invoke()
         self.assertEqual(self.channel.calls, [])
 
-    def late_setup(self):
+    def late_setup(self, replace_lease=True):
         self.channel.fault = 'upload'
         with self.assertRaises(OSError):
             self.invoke()
         self.old_lease_instance = self.lease.metadata['instance']
-        self.lease.__exit__(None, None, None)
-        self.lease.__enter__()
+        if replace_lease:
+            self.lease.__exit__(None, None, None)
+            self.lease.__enter__()
         self.late_folder = self.root / 'late-evidence'
         self.late_folder.mkdir()
         self.late_nonce = 'f' * 32
@@ -445,6 +459,21 @@ class CaptureTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.invoke_late()
         self.assertEqual(before, self.late_channel.calls)
+
+    def test_late_observer_accepts_same_still_held_lease(self):
+        self.late_setup(replace_lease=False)
+        receipt = self.invoke_late()
+        self.assertEqual(receipt['terminal_observation']['context']['lease_identity']['instance'],
+                         self.old_lease_instance)
+        self.assertEqual(self.journal.state, ro.OBSERVED)
+
+    def test_late_observer_rejects_released_lease_before_io(self):
+        self.late_setup()
+        self.lease.__exit__(None, None, None)
+        with self.assertRaises(ValueError):
+            self.invoke_late()
+        self.assertEqual(self.late_channel.calls, [])
+        self.assertEqual(self.journal.state, ro.UNKNOWN)
 
     def test_late_observer_uses_original_nonce_after_current_profile_changes(self):
         self.late_setup()

@@ -35,9 +35,11 @@ SCOPE = 'RO_METADATA'
 MAY = 'RO_METADATA_MAY_BE_ACTIVE'
 OBSERVED = 'RO_METADATA_OBSERVED'
 UNKNOWN = 'RO_METADATA_UNKNOWN'
-EXPECTED_WRITES = ('owned fixed upload /tmp/jiritsu/libJit.so and bootstrap cleanup',
+# Version-1 replay semantics are append-only; current profiles may evolve.
+HISTORICAL_CAPTURE_WRITES_V1 = ('owned fixed upload /tmp/jiritsu/libJit.so and bootstrap cleanup',
                    'nonce job directory, worker, launch, conditional exec_failure',
                    'ready.pending -> ready, start token consumed, result.pending -> result')
+EXPECTED_WRITES = HISTORICAL_CAPTURE_WRITES_V1
 
 
 def require(ok, message):
@@ -197,6 +199,18 @@ def validate_approval(approval, prepared, context):
     require(type(approval['operator']) is str and 0 < len(approval['operator'].strip()) <= 120
             and approval['explicit_approval'] is True
             and approval['binding'] == approval_payload(prepared, context), 'Approval scope or binding differs')
+
+
+def validate_historical_approval_v1(approval, reference, context):
+    """Trusted frozen schema-1 approval parser, independent of current policy."""
+    stable = {key: value for key, value in context.items() if key != 'lease_identity'}
+    expected = dict(scope='RO_METADATA', context=stable, asset_reference=reference,
+                    attempts=1, automatic_retry=False, expected_writes=list(HISTORICAL_CAPTURE_WRITES_V1),
+                    flash_authorized=False, RAM_patch_authorized=False, installation_authorized=False)
+    require(type(approval) is dict and set(approval) == {'operator', 'explicit_approval', 'binding'}
+            and type(approval['operator']) is str and 0 < len(approval['operator'].strip()) <= 120
+            and approval['explicit_approval'] is True and approval['binding'] == expected,
+            'Historical v1 approval scope or binding differs')
 
 
 def seal_history(prepared, path):
@@ -420,8 +434,7 @@ def validate_journal_details(state, details, binding, history, session_dir):
             and operation['reservation_sha256'] == sha(canonical(reservation))
             and operation['approval_sha256'] == sha(canonical(record['approval'])),
             'RO reservation/approval changed')
-    prepared = Prepared(None, canonical(reference), b'', b'')
-    validate_approval(record['approval'], prepared, context)
+    validate_historical_approval_v1(record['approval'], reference, context)
     for field in ('approval_sha256', 'reservation_sha256'):
         require(type(operation[field]) is str and re.fullmatch('[0-9a-f]{64}', operation[field]), 'Invalid RO SHA256')
     if state != MAY:
@@ -599,7 +612,7 @@ def validate_terminal_observation(observation, operation):
     binding = approval['binding']
     valid_nonce(binding['observation_nonce'])
     expected_reads = [operation['asset_reference']['job_dir'] + '/' + name
-                      for name in ('launch', 'ready', 'result')] + [SLOT]
+                      for name in ('launch', 'ready', 'result')] + ['/tmp/jiritsu/libJit.so']
     require(binding == dict(scope='RO_METADATA_EXISTING_TERMINAL_ONLY',
             observation_nonce=binding['observation_nonce'], unknown_event_sha256=observation['unknown_event_sha256'],
             operation_sha256=sha(canonical(operation)), target_id=original['target_id'], origin=original['origin'],

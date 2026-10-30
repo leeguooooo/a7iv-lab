@@ -95,7 +95,9 @@ uncertain, wrong-target or wrong-source observations retain UNKNOWN. Approval
 binds the exact UNKNOWN event, target/source, current source closure, evidence
 path and a separate attempt nonce. The intent consumes that nonce before I/O;
 replaying an attempt is forbidden. A later read requires a new explicit approval
-and attempt nonce. Old capture consent and the old held lease are never reused.
+and attempt nonce. Old capture consent is never reused. The observer requires a
+currently held valid lease: it may continue under the same still-held lease or
+acquire a new one after release; an expired lease is never accepted.
 The successful observer receipt seals its current source bytes and records its
 current lease separately, preserving historical replay after future updates. The receipt proves neither firmware,
 device identity nor image admission. Missing optional sources, including the
