@@ -24,6 +24,9 @@ SOURCE = ROOT / 'output/fl23-stock-receiver-container-01/BODYDATA.UNTESTED_DO_NO
 DIGEST = 'fc8a7865c95059dcb4ac2a347a06b4a76f016b9c37dcc8412dfe9c2c2111de6a'
 SIZE = 757480856
 REPORT = ROOT / 'output/sd-candidate-stage-01'
+EXCLUSIVE_RENAME = 'EXCLUSIVE_RENAME'
+BACKUP_COPY_ATOMIC_REPLACE = 'BACKUP_COPY_ATOMIC_REPLACE'
+ACTIVATION_PROTOCOLS = frozenset((EXCLUSIVE_RENAME, BACKUP_COPY_ATOMIC_REPLACE))
 
 
 def require(ok, message):
@@ -195,6 +198,33 @@ def _stage(report_path=None):
         raise
 
 
+def validate_activation_receipt_protocol(activation, activation_reference=None):
+    """Validate protocol evidence from host artifacts without card access."""
+    protocol = validate_activation_protocol(activation.get('activation_protocol', EXCLUSIVE_RENAME))
+    if protocol == EXCLUSIVE_RENAME:
+        require(activation.get('replacement_reference') is None, 'Exclusive activation cannot borrow replacement proof')
+        return protocol
+    from tools.card_protocol_probe import validate_probe, validate_transaction, read_reference, _flow_producer
+    require(read_reference(activation_reference) == activation, 'Independent completed activation reference required')
+    stopped = Path(activation_reference['path']).parent/'activation-stopped.json'
+    require(not stopped.exists() and not stopped.is_symlink(), 'Contradictory stopped activation evidence')
+    require(activation.get('state') == 'ACTIVATED_PREVIEW_ONLY', 'Completed outer activation required')
+    require(activation.get('single_writer_acknowledged') is True, 'Replacement acknowledgement missing')
+    old = activation['original_root_update']
+    require(old.get('exists') is True, 'Replacement original baseline required')
+    volume = activation['volume_identity']
+    root, backup = Path(activation['target']), Path(activation['backup'])
+    candidate = backup.parent / 'candidate.staged'
+    flow_directory=Path(activation_reference['path']).parents[2]
+    _flow_producer(activation_reference,'activate',flow_directory,volume)
+    validate_probe(activation.get('compatibility_probe_reference'), volume,flow_directory=flow_directory)
+    validate_transaction(activation.get('replacement_reference'), operation='ACTIVATE', card_identity=volume,
+        source=candidate, target=root, preserved=backup,
+        source_sha256=activation['source_sha256'], previous_target_sha256=old['sha256'],
+        intent_reference=activation.get('replacement_intent_reference'))
+    return protocol
+
+
 def rename_exclusive(source, target):
     """Darwin same-volume rename with atomic no-replace semantics.
 
@@ -238,8 +268,14 @@ def _path_state(path):
         return dict(path=str(path), error_type=type(error).__name__)
 
 
+def validate_activation_protocol(protocol):
+    require(type(protocol) is str and protocol in ACTIVATION_PROTOCOLS, 'Unknown card activation protocol')
+    return protocol
+
+
 def activate_staged(*, activation_authorized=False, slot1_confirmed=False, lease=None, journal=None,
-                    rename_fn=None, report_path=None):
+                    rename_fn=None, report_path=None, protocol=EXCLUSIVE_RENAME,
+                    single_writer_acknowledged=False, compatibility_probe_reference=None, flow_directory=None):
     """Activate a reviewed staged file for preview only; no installation license.
 
     Caller must explicitly approve activation and independently confirm Slot 1.
@@ -248,16 +284,26 @@ def activate_staged(*, activation_authorized=False, slot1_confirmed=False, lease
     """
     require(activation_authorized is True, 'Explicit card activation approval required')
     require(slot1_confirmed is True, 'Manual Slot 1 confirmation required')
+    validate_activation_protocol(protocol)
+    require(protocol != BACKUP_COPY_ATOMIC_REPLACE or single_writer_acknowledged is True,
+            'Backup replacement requires explicit single-writer acknowledgement')
+    require(protocol == EXCLUSIVE_RENAME or rename_fn is None,
+            'Exclusive rename injection cannot implement backup replacement')
     if lease is not None:
         require(_held_lease(lease), 'Caller-held CameraDeviceLease required')
         assert_operation_allowed(journal,allowed_states=('SD_STAGE_INTENT','SD_STAGED'))
-        return _activate_staged(rename_fn or rename_exclusive, report_path)
+        return _activate_staged(rename_fn or rename_exclusive, report_path, protocol=protocol,
+                                check_capabilities=rename_fn is None,
+                                compatibility_probe_reference=compatibility_probe_reference, flow_directory=flow_directory)
     with CameraDeviceLease('sd-activate'):
         assert_operation_allowed(journal,allowed_states=('SD_STAGE_INTENT','SD_STAGED'))
-        return _activate_staged(rename_fn or rename_exclusive, report_path)
+        return _activate_staged(rename_fn or rename_exclusive, report_path, protocol=protocol,
+                                check_capabilities=rename_fn is None,
+                                compatibility_probe_reference=compatibility_probe_reference, flow_directory=flow_directory)
 
 
-def _activate_staged(rename_fn, report_path=None):
+def _activate_staged(rename_fn, report_path=None, *, protocol=EXCLUSIVE_RENAME, check_capabilities=True,
+                     compatibility_probe_reference=None, flow_directory=None):
     report = Path(report_path) if report_path is not None else REPORT
     require(all(not p.is_symlink() for p in (report, *report.parents)),
             'Unsafe local activation report path')
@@ -301,13 +347,24 @@ def _activate_staged(rename_fn, report_path=None):
         def verify_candidate():
             require(candidate.is_file() and not candidate.is_symlink() and candidate.stat().st_size == SIZE
                     and digest(candidate, uncached=True) == DIGEST, 'Staged candidate changed')
+        if protocol == EXCLUSIVE_RENAME and check_capabilities:
+            from tools.volume_capabilities import inspect
+            capability = inspect(mount)['interfaces']['RENAME_EXCL']
+            require(capability['valid'] is True and capability['declared_supported'] is True,
+                    'Volume does not declare exclusive rename support; no activation attempted')
+        if protocol == BACKUP_COPY_ATOMIC_REPLACE:
+            from tools.card_protocol_probe import validate_probe
+            validate_probe(compatibility_probe_reference, volume,flow_directory=flow_directory)
         verify_candidate()
         require(not root_update.is_symlink(), 'Unsafe root BODYDATA path')
         existing = completed['existing_root_update']
         require(snapshot_existing(mount) == existing, 'Original root BODYDATA changed')
         require(not backup.exists() and not backup.is_symlink(), 'Original BODYDATA backup already exists')
         require(candidate.stat().st_dev == mount.stat().st_dev, 'Same-volume staged candidate required')
+        require(protocol != BACKUP_COPY_ATOMIC_REPLACE or existing['exists'] is True,
+                'Backup replacement requires a verified original root file')
         save(report/'activation-intent.json', dict(state='CARD_FILENAME_ACTIVATION_INTENT',
+             activation_protocol=protocol, compatibility_probe_reference=compatibility_probe_reference,
              source=str(candidate), target=str(root_update), backup=str(backup),
              volume_identity=volume, existing_root_update=existing,
              slot1_manually_confirmed=True, installation_authorized=False,
@@ -317,27 +374,56 @@ def _activate_staged(rename_fn, report_path=None):
         verify_identity(); verify_candidate()
         require(not root_update.is_symlink() and snapshot_existing(mount) == existing,
                 'Original root BODYDATA changed after activation intent')
-        if existing['exists']:
+        replacement_reference = replacement_intent_reference = None
+        if protocol == BACKUP_COPY_ATOMIC_REPLACE:
+            from tools.card_backup_replace import (Assurance, FileExpectation, ReplacementPlan, replace_with_backup)
+            stable = {key: volume[key] for key in identity_keys}
+            def replacement_identity():
+                current = discover()
+                require(current.get('body_matched') is True, 'Replacement body changed')
+                return {key: current[key] for key in identity_keys}
+            phase = 'BACKUP_COPY_REPLACEMENT_MAY_HAVE_OCCURRED'
+            replacement = replace_with_backup(
+                ReplacementPlan(FileExpectation(candidate, SIZE, DIGEST),
+                                FileExpectation(root_update, existing['bytes'], existing['sha256']), backup),
+                report/'replacement-evidence', expected_card_identity=stable, identity_reader=replacement_identity,
+                assurance=Assurance.SINGLE_WRITER_BACKUP_REPLACE, single_writer_acknowledged=True)
+            require(replacement.get('state') == 'COMPLETED' and replacement.get('protocol') == protocol
+                    and replacement.get('updater_invoked') is False, 'Replacement completion required')
+            proof = report/'replacement-evidence/completed.json'
+            replacement_reference = dict(path=str(proof), sha256=digest(proof))
+            intent_proof = report/'replacement-evidence/replace-intent.json'
+            replacement_intent_reference = dict(path=str(intent_proof), sha256=digest(intent_proof))
+            from tools.card_protocol_probe import validate_transaction
+            validate_transaction(replacement_reference,operation='ACTIVATE',card_identity=volume,
+                source=candidate,target=root_update,preserved=backup,source_sha256=DIGEST,
+                previous_target_sha256=existing['sha256'],intent_reference=replacement_intent_reference)
+        elif existing['exists']:
             phase = 'ORIGINAL_BACKUP_RENAME_MAY_HAVE_OCCURRED'
             rename_fn(root_update, backup)
             _sync_directory(mount); _sync_directory(folder)
             require(backup.is_file() and not backup.is_symlink()
                     and backup.stat().st_size == existing['bytes']
                     and digest(backup, uncached=True) == existing['sha256'], 'Original backup readback mismatch')
-        verify_identity()
-        phase = 'CANDIDATE_ROOT_RENAME_MAY_HAVE_OCCURRED'
-        rename_fn(candidate, root_update)
-        _sync_directory(mount); _sync_directory(folder)
+        if protocol == EXCLUSIVE_RENAME:
+            verify_identity()
+            phase = 'CANDIDATE_ROOT_RENAME_MAY_HAVE_OCCURRED'
+            rename_fn(candidate, root_update)
+            _sync_directory(mount); _sync_directory(folder)
         require(root_update.is_file() and not root_update.is_symlink()
                 and root_update.stat().st_size == SIZE and digest(root_update, uncached=True) == DIGEST,
                 'Activated root candidate readback mismatch')
         verify_identity()
-        result = dict(state='ACTIVATED_PREVIEW_ONLY', target=str(root_update), backup=str(backup),
+        result = dict(state='ACTIVATED_PREVIEW_ONLY', activation_protocol=protocol,
+                      replacement_reference=replacement_reference, replacement_intent_reference=replacement_intent_reference,
+                      compatibility_probe_reference=compatibility_probe_reference,
+                      single_writer_acknowledged=protocol == BACKUP_COPY_ATOMIC_REPLACE, target=str(root_update), backup=str(backup),
                       original_root_update=existing, source_sha256=DIGEST, bytes=SIZE,
                       volume_identity=volume, slot1_manually_confirmed=True,
                       updater_invoked=False, installation_authorized=False,
                       camera_internal_firmware_modified=False, automatic_retry=False)
         save(report/'activated-preview-only.json', result)
+        _sync_directory(report)
         return result
     except BaseException as error:
         stopped = dict(state='ACTIVATION_STOPPED_UNKNOWN', phase=phase,

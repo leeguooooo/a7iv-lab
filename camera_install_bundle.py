@@ -19,6 +19,7 @@ from camera_install_flow import source_paths, validate_config, CONFIG_SCHEMA
 from camera_install_operator import prepare_static_facts, write_operator_template
 from camera_stream_execution import durable_new
 from camera_toolchain import PLAIN, PACKAGE_SHA
+from camera_sd_stage import EXCLUSIVE_RENAME, ACTIVATION_PROTOCOLS, validate_activation_protocol
 
 ROOT = Path(__file__).resolve().parent
 CAPTURE_GROUPS = {'runtime-assets':('post_p1',),'patch-captures':('pre_app','pre_ufp'),
@@ -67,8 +68,9 @@ def build_assets(output):
     return out
 
 
-def seal_bundle(assets_directory, output, *, body_reference):
+def seal_bundle(assets_directory, output, *, body_reference, card_activation_protocol=EXCLUSIVE_RENAME):
     """Seal executable steps and truthful risk facts, not missing on-site approvals."""
+    validate_activation_protocol(card_activation_protocol)
     assets=safe_path(assets_directory);out=safe_path(output)
     require(assets.is_relative_to(ROOT/'output') and assets.is_dir()
             and out.is_relative_to(ROOT/'output') and not out.exists(),'Existing assets and fresh workspace seal required')
@@ -99,7 +101,7 @@ def seal_bundle(assets_directory, output, *, body_reference):
         path=snapshots/name;path.parent.mkdir(mode=0o700,parents=True,exist_ok=True);_write(path,raw)
     for directory in sorted((p for p in snapshots.rglob('*') if p.is_dir()),key=lambda p:len(p.parts),reverse=True):_sync(directory)
     _sync(snapshots)
-    config=dict(schema=CONFIG_SCHEMA,body_sha256=binding['body_sha256'],candidate_sha256=PACKAGE_SHA,
+    config=dict(schema=CONFIG_SCHEMA,card_activation_protocol=card_activation_protocol,body_sha256=binding['body_sha256'],candidate_sha256=PACKAGE_SHA,
         original_plan_reference=original_ref,
         runtime=dict(review_reference=dict(path=runtime_review['review_path'],sha256=runtime_review['review_sha256']),asset_reference=prepared_runtime.reference),
         patch=dict(review_reference=original_ref,asset_reference=prepared_patch.reference),
@@ -123,9 +125,10 @@ def main():
     build=sub.add_parser('build');build.add_argument('--output',type=Path,required=True)
     seal=sub.add_parser('seal');seal.add_argument('--assets',type=Path,required=True);seal.add_argument('--output',type=Path,required=True)
     seal.add_argument('--body-reference',type=Path,required=True)
+    seal.add_argument('--card-activation-protocol',choices=sorted(ACTIVATION_PROTOCOLS),default=EXCLUSIVE_RENAME)
     a=p.parse_args()
     if a.command=='build':print(json.dumps(dict(assets_directory=str(build_assets(a.output)),hardware_operations=0)))
-    else:print(json.dumps(seal_bundle(a.assets,a.output,body_reference=a.body_reference)))
+    else:print(json.dumps(seal_bundle(a.assets,a.output,body_reference=a.body_reference,card_activation_protocol=a.card_activation_protocol)))
 
 
 if __name__=='__main__':main()

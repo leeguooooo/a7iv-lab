@@ -462,6 +462,8 @@ def validate_completed_card(reference, *, stage_reference=None, activation_refer
             'Card stage/activation references differ')
     _, stage = load_reference(stage_reference)
     _, activation = load_reference(activation_reference)
+    from camera_sd_stage import validate_activation_receipt_protocol
+    validate_activation_receipt_protocol(activation, activation_reference)
     stages = [e for e in history[:index] if e['state'] == 'SD_STAGED']
     require(len(stages) == 1 and stages[0]['details'].get('stage_report') == stage_reference['path']
             and stages[0]['details'].get('stage_report_sha256') == stage_reference['sha256'], 'Card stage journal binding differs')

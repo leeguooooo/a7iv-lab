@@ -20,24 +20,24 @@ from camera_install_io import JournalSnapshotPin
 from camera_operation_guard import DEFAULT_SESSIONS, assert_operation_allowed
 from camera_install_patch_session import _source_only_runtime, _held_lease, review_source_paths, SOURCE_ONLY_RUNTIME
 from camera_install_receipts import load_reference, safe_path, sha, canonical
-from camera_sd_stage import DIGEST
+from camera_sd_stage import DIGEST, EXCLUSIVE_RENAME, BACKUP_COPY_ATOMIC_REPLACE, validate_activation_protocol
 from camera_package_audit import PLAIN_SHA
 from camera_stream_execution import durable_new
 
 ROOT = Path(__file__).resolve().parent
 SCHEMA = 'camera-install-flow/1'
 CONFIG_SCHEMA = 'camera-install-flow-config/1'
-STEPS = ('runtime','stage','activate','patch','prepare-read','read','observe-card','admit',
+STEPS = ('runtime','probe','stage','activate','patch','prepare-read','read','observe-card','admit',
          'start','complete','prepare-post','post','content','features','withdraw','prepare-epoch','cancel')
 HOST_ONLY = frozenset(('prepare-read','prepare-post','prepare-epoch','admit','start','complete','content','features'))
 PHASES = frozenset(('INTENT','COMPLETED','UNKNOWN','REJECTED_LOCAL','BLOCKED_READ_ONLY'))
-PHYSICAL = frozenset(('runtime','stage','activate','patch','read','observe-card','post','withdraw','cancel'))
+PHYSICAL = frozenset(('runtime','probe','stage','activate','patch','read','observe-card','post','withdraw','cancel'))
 FORMAL = frozenset(('admit','start','complete','content','features'))
-TOOL_SOURCES = frozenset(('native/install_patch_read.c','native/install_runtime_metadata.c',
+TOOL_SOURCES = frozenset(('tools/card_backup_replace.py','tools/card_protocol_probe.py','tools/volume_capabilities.py','native/install_patch_read.c','native/install_runtime_metadata.c',
     'tools/build_install_patch_read_offline.py','tools/verify_install_patch_read_offline.py','tools/install_patch_read_profile.py','tools/emulate_install_patch_read_offline.py',
     'tools/build_install_runtime_metadata_offline.py','tools/verify_install_runtime_metadata_offline.py','tools/install_runtime_metadata_profile.py','tools/emulate_install_runtime_metadata_offline.py',
     'tools/menu_window_profile.py','tools/verify_menu_window_offline.py','tools/model_toolchain_bootstraps_offline.py','tools/emulate_stream_bootstrap.py'))
-STATES = {'runtime':('PLANNED',),'stage':('PLANNED',),'activate':('SD_STAGED',),'patch':('SD_STAGED',),
+STATES = {'runtime':('PLANNED',),'probe':('PLANNED','SD_STAGED'),'stage':('PLANNED',),'activate':('SD_STAGED',),'patch':('SD_STAGED',),
     'prepare-read':('INSTALL_PATCH_AWAITING_OPERATOR_RECONNECT',),'read':('INSTALL_PATCH_AWAITING_OPERATOR_RECONNECT',),
     'observe-card':('INSTALL_PATCH_AWAITING_OPERATOR_RECONNECT',),'admit':('INSTALL_PATCH_AWAITING_OPERATOR_RECONNECT',),
     'start':('INSTALL_READY_FOR_OPERATOR_START',),'complete':('FLASH_MAY_HAVE_STARTED',),
@@ -80,6 +80,7 @@ def source_paths():
 
 def validate_config(config_reference, *, injected=False):
     config=_load(config_reference)
+    validate_activation_protocol(config.get('card_activation_protocol', EXCLUSIVE_RENAME))
     require(config.get('schema')==CONFIG_SCHEMA and config.get('candidate_sha256')==DIGEST
         and type(config.get('model_fixture_only',False)) is bool
         and (injected or config.get('model_fixture_only',False) is False),'Formal flow config required')
@@ -165,7 +166,33 @@ def init_flow(config_reference, output, *, injected_execution=False):
     return status(folder)
 
 
-def _open(folder):
+def _producer_journal_binding(header, config, intent):
+    """Check only the hash-bound ancestor recorded before a successful actor."""
+    from camera_install_journal import _read_json, _canonical, _binding, _transition
+    session=local(header['journal_session'],directory=True)
+    require(session.parent==DEFAULT_SESSIONS,'Canonical producer journal required')
+    expected=dict(body_sha256=config['body_sha256'],plan_sha256=config['original_plan_reference']['sha256'],model='ILCE-7M4')
+    target=intent.get('journal_event_sha256')
+    require(isinstance(target,str) and len(target)==64,'Producer intent journal ancestor required')
+    history=[]
+    for index in range(1,10001):
+        raw,event=_read_json(session/f'{index:08d}.json')
+        require(set(event)=={'schema','session_id','seq','prev_sha256','binding','state','details','event_sha256'}
+                and raw==_canonical(event) and type(event['schema']) is int and event['schema']==1
+                and type(event['seq']) is int and event['seq']==index and event['session_id']==session.name,
+                'Producer journal ancestor shape differs')
+        _binding(event['binding'])
+        require(event['binding']==expected and event['prev_sha256']==(history[-1]['event_sha256'] if history else '0'*64)
+                and event['event_sha256']==sha(_canonical({k:v for k,v in event.items() if k!='event_sha256'})),
+                'Producer journal ancestor binding/hash differs')
+        _transition(history,event['state']);history.append(event)
+        if event['event_sha256']==target:return expected
+    raise ValueError('Producer journal ancestor exceeded bound')
+
+
+def _open(folder, *, _producer_step=None):
+    require(_producer_step is None or _producer_step in ('probe','activate','withdraw'),'Bounded producer step required')
+    producer_intent=None
     folder=local(folder,directory=True);header=_load(reference(folder/'flow.json'))
     require(header.get('schema')==SCHEMA and type(header.get('injected_execution')) is bool,'Flow header required')
     config=validate_config(header['config_reference'],injected=header['injected_execution'])
@@ -178,6 +205,7 @@ def _open(folder):
         if phase=='INTENT':
             require(active is None and not unknown and step not in completed and attempt==attempts.get(step,0)+1,'Invalid or overlapping flow attempt')
             attempts[step]=attempt;active=(step,attempt)
+            if step==_producer_step:producer_intent=event
         else:
             require(active==(step,attempt),'Flow result has no matching active intent')
             active=None
@@ -192,6 +220,11 @@ def _open(folder):
                 require(step in HOST_ONLY and event.get('journal_unchanged') is True and event.get('SDK_requests_attempted') is False
                     and event.get('manual_instruction_released') is False and event.get('automatic_retry') is False,'Invalid local-only rejection proof')
         events.append(event);previous=event['event_sha256']
+        if step==_producer_step and phase=='COMPLETED':
+            require(producer_intent is not None and header['injected_execution'] is False
+                    and event.get('source_is_hardware') is True,'Real successful producer prefix required')
+            return folder,header,config,events,_producer_journal_binding(header,config,producer_intent)
+    require(_producer_step is None,'Required completed producer step missing')
     journal=InstallJournal.open(local(header['journal_session'],directory=True))
     require(journal.binding==dict(body_sha256=config['body_sha256'],plan_sha256=config['original_plan_reference']['sha256'],model='ILCE-7M4'),'Flow original journal binding changed')
     if not header['injected_execution']:require(journal.session_dir.parent==DEFAULT_SESSIONS,'Canonical production journal required')
@@ -329,9 +362,23 @@ def _dispatch(step,folder,config,events,journal,lease,operator,*,before_journal_
         review=config['runtime']['review_reference'];values=_load(review)
         run_runtime_session(body,folder,plan_sha256=plan,review_path=review['path'],review_sha256=review['sha256'],assets=_runtime_assets(config),required_partition_sizes=values['required_partition_sizes'],runtime_read_authorized=True,**common)
         return dict(artifact_reference=reference(folder/'runtime-session-exit.json'))
+    if step=='probe':
+        from camera_sd_stage import discover
+        from tools.card_protocol_probe import probe
+        _artifact(events,'runtime')
+        require(config.get('card_activation_protocol')==BACKUP_COPY_ATOMIC_REPLACE,
+                'Scratch probe is only for the explicitly selected replacement protocol')
+        require(all(operator.get(key) is True for key in ('scratch_authorized','single_writer_acknowledged','slot1_confirmed')),
+                'Explicit scratch, single-writer and Slot 1 approval required')
+        volume=discover();require(volume['body_sha256']==body,'Probe camera differs from flow')
+        ref=probe(volume['mount'],folder/'probe-run',expected_card_identity=volume,identity_reader=discover,
+            scratch_authorized=True,single_writer_acknowledged=True)
+        return dict(artifact_reference=ref)
     if step=='stage':
         import camera_sd_stage as sd
-        _artifact(events,'runtime');recording();journal.advance('SD_STAGE_INTENT',details=dict(operation='formal-flow-stage',config_reference=config['original_plan_reference']))
+        _artifact(events,'runtime')
+        if config.get('card_activation_protocol')==BACKUP_COPY_ATOMIC_REPLACE:_artifact(events,'probe')
+        recording();journal.advance('SD_STAGE_INTENT',details=dict(operation='formal-flow-stage',config_reference=config['original_plan_reference']))
         require(sd.discover()['body_sha256']==body,'Staging camera differs from flow body')
         sd.stage(report_path=folder,**common);ref=reference(folder/'completed.json')
         recording();journal.advance('SD_STAGED',details=dict(stage_report=ref['path'],stage_report_sha256=ref['sha256']))
@@ -339,7 +386,14 @@ def _dispatch(step,folder,config,events,journal,lease,operator,*,before_journal_
     if step=='activate':
         from camera_sd_stage import activate_staged
         require(operator.get('slot1_confirmed') is True,'Explicit Slot 1 observation required')
-        stage=_artifact(events,'stage');activate_staged(activation_authorized=True,slot1_confirmed=True,report_path=Path(stage['path']).parent,**common)
+        protocol=config.get('card_activation_protocol',EXCLUSIVE_RENAME)
+        require(protocol != BACKUP_COPY_ATOMIC_REPLACE or operator.get('single_writer_acknowledged') is True,
+                'Explicit same-card single-writer acknowledgement required')
+        probe_reference=_artifact(events,'probe') if protocol==BACKUP_COPY_ATOMIC_REPLACE else None
+        stage=_artifact(events,'stage');activate_staged(activation_authorized=True,slot1_confirmed=True,
+            report_path=Path(stage['path']).parent,protocol=protocol,
+            single_writer_acknowledged=operator.get('single_writer_acknowledged') is True,
+            compatibility_probe_reference=probe_reference,flow_directory=folder.parents[1],**common)
         return dict(artifact_reference=reference(Path(stage['path']).parent/'activated-preview-only.json'))
     if step=='patch':
         from camera_install_patch_session import run_install_patch_session
@@ -401,7 +455,10 @@ def _dispatch(step,folder,config,events,journal,lease,operator,*,before_journal_
     if step=='withdraw':
         from camera_install_card_withdraw import withdraw_active_card,withdraw_staged_card
         require(all(operator.get(k) is True for k in ('operator_never_started_confirmed','operator_health_confirmed')),'Explicit healthy/never-started withdrawal statements required')
-        args=dict(body_sha256=body,plan_sha256=plan,withdrawal_authorized=True,operator_never_started_confirmed=True,operator_health_confirmed=True,**common)
+        args=dict(body_sha256=body,plan_sha256=plan,withdrawal_authorized=True,operator_never_started_confirmed=True,operator_health_confirmed=True,
+            single_writer_acknowledged=operator.get('single_writer_acknowledged') is True,
+            compatibility_probe_reference=_artifact(events,'probe') if config.get('card_activation_protocol')==BACKUP_COPY_ATOMIC_REPLACE else None,
+            flow_directory=folder.parents[1],**common)
         if journal.state=='SD_STAGED':withdraw_staged_card(_artifact(events,'stage'),_artifact(events,'activate'),folder,**args)
         else:withdraw_active_card(_artifact(events,'stage'),_artifact(events,'activate'),folder,pending_reference=_artifact(events,'patch'),**args)
         return dict(artifact_reference=reference(folder/'withdrawal-completed.json'))

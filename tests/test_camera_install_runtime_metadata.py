@@ -55,6 +55,12 @@ class Channel:
 class MetadataTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory(dir=meta.ROOT/'output');self.addCleanup(self.temp.cleanup);self.root=Path(self.temp.name)
+        source_root=meta.ROOT
+        for name in ('camera_install_runtime_metadata.py','tools/emulate_install_runtime_metadata_offline.py','tools/install_runtime_metadata_profile.py'):
+            destination=self.root/name;destination.parent.mkdir(parents=True,exist_ok=True)
+            destination.write_bytes((source_root/name).read_bytes())
+        (self.root/'output').mkdir()
+        self.enterContext(patch.object(meta,'ROOT',self.root))
         self.job=self.root/'job';self.job.mkdir();self.folder=self.root/'evidence';self.folder.mkdir();self.nonce=b'm'*16
         self.manifest=dict(nonce=self.nonce.hex(),sources={},artifacts={});(self.job/'manifest.json').write_text(json.dumps(self.manifest));(self.job/'libJit.so').write_bytes(b'module');(self.job/'worker.debug.elf').write_bytes(b'debug-worker')
         verification={'all_passed':True};vh=digest(meta._json(verification).encode());mh=digest((self.job/'manifest.json').read_bytes())
