@@ -1,6 +1,6 @@
 # A7 IV QEMU 的可复用源码与验证范围
 
-观察项目：[16480000/sony-a7iv-qemu](https://github.com/16480000/sony-a7iv-qemu)。2026-10-30 核查的 main 为 `3637f15da850bea406bacd755381020b511b3867`，只有 main 分支，Issue、PR 和 GitHub Releases 列表为空。`v0.1` 标签仍指向较早的 `3fcc1c3d4157da5724619b61675f53dda826f906`。
+观察项目：[16480000/sony-a7iv-qemu](https://github.com/16480000/sony-a7iv-qemu)。2026-10-31 复核的 main 为 `3637f15da850bea406bacd755381020b511b3867`，只有 main 分支，Issue、PR 和 GitHub Releases 列表为空。`v0.1` 标签仍指向较早的 `3fcc1c3d4157da5724619b61675f53dda826f906`，注解时间为2026-10-19；这次未发现新增发行。
 
 这个项目最适合帮助我们研究同版 A7M4 6.02 的原厂菜单、资源和协议。源码中的原厂 AP 执行、虚拟 CP、网页声音和网页拍照必须分别判断。它没有证明照片或视频已经应用任意 3D LUT，也没有提供我们的声音共享菜单基线。
 

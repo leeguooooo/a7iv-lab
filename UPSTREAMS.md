@@ -14,7 +14,7 @@
 
 | 项目 | 观察范围 | 最近核查的远端版本 |
 |---|---|---|
-| [16480000/sony-a7iv-qemu](https://github.com/16480000/sony-a7iv-qemu) | A7M4 6.02 原厂 AP、菜单、显示、输入、虚拟 CP 与声音模拟；跟踪代码、Issue、PR、标签和发行 | `main` · `3637f15da850bea406bacd755381020b511b3867`，2026-10-30 |
+| [16480000/sony-a7iv-qemu](https://github.com/16480000/sony-a7iv-qemu) | A7M4 6.02 原厂 AP、菜单、显示、输入、虚拟 CP 与声音模拟；跟踪代码、Issue、PR、标签和发行 | `main` · `3637f15da850bea406bacd755381020b511b3867`，2026-10-31 |
 
 后续仓库更新核查包括此项目。该记录是观察基线，不表示已将上游代码接入本项目，也没有创建自动订阅任务。本次远端 Issue、PR 与 GitHub Releases 列表为空。
 
