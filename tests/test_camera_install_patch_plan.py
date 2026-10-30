@@ -28,6 +28,8 @@ class PlanTests(unittest.TestCase):
         self.patches = [patch.object(plan, 'ROOT', self.root),
             patch.object(plan, 'review_source_paths', return_value=('host.py',)),
             patch.object(plan, 'preflight_assets', return_value=self.prepared),
+            patch.object(plan, '_candidate_package_check', return_value=dict(local_checks_passed=True,
+                package_sha256='c'*64, plaintext_sha256='d'*64)),
             patch.object(plan, 'validate_review', side_effect=self.validate)]
         for value in self.patches:
             value.start()

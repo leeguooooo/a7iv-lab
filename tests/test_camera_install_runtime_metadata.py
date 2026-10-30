@@ -25,9 +25,10 @@ class Channel:
         for n in meta.NUMBERS:
             target=f'cnflasha{n}'.encode();st=bytearray(128);struct.pack_into('<I',st,16,0o60000);struct.pack_into('<Q',st,32,252*256+128+n)
             aliases.append(meta.ALIAS.pack(n,len(target),0o60000,252*256+128+n,target,st))
-        self.aliases=b''.join(aliases)
+        self.boot_id='abcdefab-2222-4333-8444-555555555555'
+        self.aliases=b''.join(aliases)+self.boot_id.encode()+bytes(4)
     def frame(self,phase):
-        return meta.FRAME.pack(meta.MAGIC,self.nonce,1,phase,0,0,777,1,888,0,13 if phase==1 else 61,
+        return meta.FRAME.pack(meta.MAGIC,self.nonce,meta.VERSION,phase,0,0,777,1,888,0,13 if phase==1 else 61,
             0 if phase==1 else len(self.proc),0 if phase==1 else len(self.aliases),bytes(32) if phase==1 else hashlib.sha256(self.proc).digest(),bytes(32) if phase==1 else hashlib.sha256(self.aliases).digest())
     def read_loader(self,path):self.calls.append(path);return None if path==meta.SLOT else b'library'
     def upload_once(self,module,sha,path):
@@ -77,6 +78,28 @@ class MetadataTests(unittest.TestCase):
         receipt=self.invoke();self.assertFalse(receipt['source_is_hardware']);parsed=meta.validate_receipt(receipt,reference=receipt['asset_reference'],reservation=self.reservation)
         self.assertEqual(parsed['alias_targets']['nflasha15'],'/dev/cnflasha15');self.assertEqual((self.channel.uploads,self.channel.starts),(1,1));self.assertTrue((self.folder/'metadata-receipt.json').exists());self.assertEqual(self.journal.state,'PLANNED')
         for name in ('installation_authorized','write_admission','restoration_proven'):self.assertIs(receipt[name],False)
+    def test_v2_boot_uuid_is_hash_bound_and_legacy_requires_explicit_forensic_mode(self):
+        receipt=self.invoke()
+        parsed=meta.validate_receipt(receipt,reference=receipt['asset_reference'],reservation=self.reservation)
+        self.assertEqual(parsed['boot_id'],self.channel.boot_id)
+        self.assertEqual(parsed['metadata_version'],2)
+        for suffix in (b'0'*40, self.channel.boot_id.upper().encode()+bytes(4), self.channel.boot_id.encode()+b'x'*4):
+            changed=dict(receipt,aliases_raw_hex=(bytes.fromhex(receipt['aliases_raw_hex'])[:1728]+suffix).hex())
+            with self.assertRaises(ValueError):meta.validate_receipt(changed,reference=changed['asset_reference'],reservation=self.reservation)
+    def test_legacy_v1_is_explicit_forensic_only(self):
+        receipt=self.invoke();legacy=dict(receipt)
+        legacy['raw_publications']=dict(receipt['raw_publications'])
+        payload=self.channel.aliases[:1728];legacy['aliases_raw_hex']=payload.hex()
+        for name,phase in (('ready',1),('result',7)):
+            values=list(meta.FRAME.unpack(bytes.fromhex(legacy['raw_publications'][name])))
+            values[0]=meta.LEGACY_MAGIC;values[2]=1
+            if phase==7:values[-3]=1728;values[-1]=hashlib.sha256(payload).digest()
+            legacy['raw_publications'][name]=meta.FRAME.pack(*values).hex()
+        with self.assertRaises(ValueError):meta.validate_receipt(legacy,reference=legacy['asset_reference'],reservation=self.reservation)
+        observed=meta.validate_receipt(legacy,reference=legacy['asset_reference'],reservation=self.reservation,forensic_legacy=True)
+        self.assertEqual(observed['metadata_version'],1);self.assertIsNone(observed['boot_id'])
+        legacy['source_is_hardware']=True
+        with self.assertRaises(ValueError):meta.validate_receipt(legacy,reference=legacy['asset_reference'],reservation=self.reservation,forensic_legacy=True)
     def test_bad_authorization_before_any_IO(self):
         with self.assertRaises(ValueError):self.invoke(metadata_read_authorized=False)
         self.factory.assert_not_called();self.assertFalse(self.channel.calls)
@@ -159,4 +182,106 @@ class MetadataTests(unittest.TestCase):
         with self.assertRaises(ValueError):meta.validate_receipt(receipt,reference=receipt['asset_reference'],reservation=self.reservation)
 
 
+class PendingEpochMetadataTests(unittest.TestCase):
+    def setUp(self):
+        import test_camera_install_cancel as prior_fixture
+        self.base=MetadataTests();self.base.setUp();self.addCleanup(self.base.doCleanups)
+        self.prior=prior_fixture.CancellationAssessmentTests();self.prior.setUp();self.addCleanup(self.prior.doCleanups)
+        f=self.prior
+        self.initial=self.base.root/'before-runtime.json';self.initial.write_text('{}')
+        self.withdrawal=self.base.root/'withdrawal.json';self.withdrawal.write_text('{}')
+        self.initial_ref=dict(path=str(self.initial),sha256=digest(self.initial.read_bytes()))
+        self.withdrawal_ref=dict(path=str(self.withdrawal),sha256=digest(self.withdrawal.read_bytes()))
+        self.summary=dict(initial_boot_id='11111111-2222-4333-8444-555555555555',prior_nonces=['1'*32],sources_declared_hardware=False)
+        self.enterContext(patch.object(meta,'_pending_epoch_sources',return_value=self.summary))
+        self.reservation=None
+
+    def options(self):
+        f=self.prior
+        return dict(lease=f.session.lease,journal=f.session.journal,body_sha256=f.body,plan_sha256=f.session.plan,
+            pending_reference=f.pending_reference,initial_runtime_reference=self.initial_ref,
+            withdrawal_reference=self.withdrawal_ref,operator_never_started_confirmed=True)
+
+    def reserve(self):
+        self.reservation=meta.reserve_pending_epoch_assets(meta.preflight_assets(self.base.assets),self.base.folder,**self.options())
+
+    def invoke(self,**changes):
+        if self.reservation is None:self.reserve()
+        values=dict(assets=self.base.assets,reservation=self.reservation,metadata_read_authorized=True,
+            source_is_hardware=True,channel_factory=self.base.factory,clock=lambda:self.base.time,sleep=self.base.sleep,
+            **self.options());values.update(changes)
+        return meta.capture_pending_epoch_authenticated(None,self.base.folder,**values)
+
+    def test_dedicated_pending_epoch_scope_is_bound_and_injected_false(self):
+        receipt=self.invoke()
+        self.assertEqual(self.reservation['record']['context']['scope'],meta.EPOCH_SCOPE)
+        self.assertEqual(self.reservation['record']['context']['pending_reference'],self.prior.pending_reference)
+        self.assertFalse(receipt['source_is_hardware'])
+        self.assertEqual(meta.validate_receipt(receipt,reference=receipt['asset_reference'],reservation=self.reservation)['metadata_version'],2)
+        self.assertEqual(self.prior.session.journal.state,'INSTALL_PATCH_AWAITING_OPERATOR_RECONNECT')
+
+    def test_original_generic_capture_cannot_use_pending_reservation(self):
+        self.reserve()
+        options=self.options()
+        for key in ('pending_reference','initial_runtime_reference','withdrawal_reference','operator_never_started_confirmed'):options.pop(key)
+        with self.assertRaises(ValueError):meta.capture_authenticated(None,self.base.folder,assets=self.base.assets,
+            reservation=self.reservation,metadata_read_authorized=True,channel_factory=self.base.factory,**options)
+        self.base.factory.assert_not_called()
+
+    def test_mutated_original_runtime_reference_precedes_transport(self):
+        self.reserve();self.initial.write_text('{"changed":true}')
+        with self.assertRaises(ValueError):self.invoke()
+        self.base.factory.assert_not_called()
+
+    def test_default_transport_cannot_promote_synthetic_sources(self):
+        self.reserve()
+        with self.assertRaises(ValueError):self.invoke(channel_factory=None)
+        self.base.factory.assert_not_called()
+
+    def test_prior_job_nonce_cannot_be_reused_even_without_claimfile(self):
+        self.summary['prior_nonces']=[self.base.nonce.hex()]
+        with self.assertRaises(ValueError):self.reserve()
+        self.base.factory.assert_not_called()
+
+    def test_lease_replacement_after_loader_stops_before_upload(self):
+        original=self.base.channel.read_loader
+        def swap(path):
+            raw=original(path);self.prior.session.lease.__exit__(None,None,None);self.prior.session.lease.__enter__();return raw
+        self.base.channel.read_loader=swap
+        with self.assertRaises(ValueError):self.invoke()
+        self.assertEqual((self.base.channel.uploads,self.base.channel.starts),(0,0))
+
+
 if __name__=='__main__':unittest.main()
+
+
+class EpochSourceLineageTests(unittest.TestCase):
+    def setUp(self):
+        import test_camera_install_cancel as fixtures
+        self.f=fixtures.CancellationAssessmentTests();self.f.setUp();self.addCleanup(self.f.doCleanups)
+        self.history=self.f.session.journal.events
+        self.may=next(i for i,e in enumerate(self.history) if e['state']=='INSTALL_PATCH_MAY_BE_ACTIVE')
+        pending=json.loads(Path(self.f.pending_reference['path']).read_text())
+        self.prior=dict(receipt=pending,ancestor_index=len(self.history)-1,source_is_hardware=False)
+        self.before=dict(metadata_version=2,boot_id='11111111-2222-4333-8444-555555555555',ancestor_index=self.may-1,
+            source_is_hardware=False,receipt={'asset_reference':{'metadata':{'nonce':'7'*32}}})
+        self.enterContext(patch('camera_install_receipts.validate_completed_pending',return_value=self.prior))
+        self.enterContext(patch('camera_install_receipts.validate_completed_runtime',return_value=self.before))
+        self.enterContext(patch('camera_install_card_withdraw.validate_withdrawal_receipt',return_value={'source_is_hardware':False}))
+        self.enterContext(patch.object(meta,'withdrawal_stage_reference',return_value=self.f.reference))
+
+    def invoke(self):
+        return meta._pending_epoch_sources(self.f.pending_reference,{}, {},binding=self.f.session.journal.binding,
+            history=self.history,session_dir=self.f.session.journal.session_dir)
+
+    def test_before_epoch_must_precede_patch_intent_and_remain_v2(self):
+        self.assertFalse(self.invoke()['sources_declared_hardware'])
+        self.before['ancestor_index']=self.may
+        with self.assertRaises(ValueError):self.invoke()
+        self.before['ancestor_index']=self.may-1;self.before['metadata_version']=1
+        with self.assertRaises(ValueError):self.invoke()
+
+    def test_all_prior_job_nonces_are_reserved_from_epoch_reuse(self):
+        summary=self.invoke()
+        self.assertEqual(len(summary['prior_nonces']),4)
+        self.assertIn('7'*32,summary['prior_nonces'])

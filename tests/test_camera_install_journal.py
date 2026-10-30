@@ -8,22 +8,20 @@ import unittest
 from unittest import mock
 
 import camera_install_journal as ledger
+from install_model_fixture import formal_complete, formal_flash
 
 
 class JournalTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.host = Path(self.temp.name)
+        self.host = Path(self.temp.name).resolve()
         self.root = self.host / 'sessions'
         self.binding = dict(plan_sha256='a' * 64, body_sha256='b' * 64, model='synthetic-FL23')
         self.journal = ledger.InstallJournal.create(self.root, 'attempt-1', **self.binding)
 
     def completed_report(self):
-        for phase in ('SD_STAGE_INTENT', 'SD_STAGED', 'RAM_MAY_BE_ACTIVE',
-                      'READY_FOR_CONFIRMATION', 'FLASH_MAY_HAVE_STARTED',
-                      'DEVICE_COMPLETION_REPORTED'):
-            self.journal.advance(phase)
+        formal_complete(self, self.journal)
         path = self.host / 'verification.json'
         path.write_text(json.dumps(dict(self.binding, source_is_hardware=True, all_passed=True)))
         return path
@@ -441,7 +439,9 @@ class JournalTests(unittest.TestCase):
 
     def test_ram_restoration_refuses_flash_history_and_unknown(self):
         artifact, _ = self.ram_report(ready=True)
-        self.journal.advance('FLASH_MAY_HAVE_STARTED')
+        self.root = self.host / 'formal-sessions'
+        self.journal = ledger.InstallJournal.create(self.root, 'formal-attempt', **self.binding)
+        formal_flash(self, self.journal)
         with self.assertRaisesRegex(ledger.JournalError, 'possible flash writes'):
             self.journal.record_ram_restoration_verified(artifact)
         self.journal.advance('STOPPED_UNKNOWN')

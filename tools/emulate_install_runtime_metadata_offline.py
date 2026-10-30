@@ -8,24 +8,32 @@ from unicorn.arm64_const import UC_ARM64_REG_SP,UC_ARM64_REG_X0,UC_ARM64_REG_X8
 from elftools.elf.elffile import ELFFile
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0,str(Path(__file__).resolve().parent))
-from camera_install_runtime_metadata import FRAME,START_FRAME,START_MAGIC,ALIAS,NUMBERS,decode_frame
+from camera_install_runtime_metadata import FRAME,START_FRAME,START_MAGIC,VERSION,ALIAS,NUMBERS,decode_frame
 from install_runtime_metadata_profile import ROOT,require,sha,jobpath
 from verify_install_runtime_metadata_offline import verify
 from emulate_install_patch_read_offline import _bootstrap_case,READ_BOOTSTRAP_CASES
 from model_toolchain_bootstraps_offline import module_info
 BOOTSTRAP_CASES=READ_BOOTSTRAP_CASES
 CASES=('success','relative_alias','positive_short_read','read_eintr','transient_parent','parent_never_settles',
+ 'boot_eintr','boot_positive_short_read','missing_boot','boot_read_error','boot_close_error','boot_short','boot_overflow','boot_uppercase','boot_zero','boot_changed','boot_second_error','old_START',
  'not_root','wrong_tmpfs','missing_proc','proc_error','proc_close_error','proc_overflow','missing_alias',
  'readlink_error','readlink_oversize','wrong_target','stat_error','not_block','alias_change','rdev_change',
  'wrong_START','partial_START','missing_START','ready_open_error','ready_write_error','ready_close_error',
  'payload_open_error','payload_write_error','payload_close_error','result_open_error','result_write_error',
  'result_close_error','rename_error','destination_exists','interrupted_after_payload')
-SUCCESS={'success','relative_alias','positive_short_read','read_eintr','transient_parent'}
+SUCCESS={'success','relative_alias','positive_short_read','read_eintr','transient_parent','boot_eintr','boot_positive_short_read'}
 def emulate(job,case,m):
- require(case in CASES,'Unknown metadata case');nonce=bytes.fromhex(m['nonce']);directory=m['job_dir'];token=START_FRAME.pack(START_MAGIC,nonce,1)
+ require(case in CASES,'Unknown metadata case');nonce=bytes.fromhex(m['nonce']);directory=m['job_dir'];token=START_FRAME.pack(START_MAGIC,nonce,VERSION)
+ if case=='old_START':token=START_FRAME.pack(START_MAGIC,nonce,1)
  if case=='wrong_START':token=b'WRONG123'+token[8:]
  if case=='partial_START':token=token[:20]
  files={directory+'/worker':b'worker',directory+'/start':token};proc=b'major minor  #blocks  name\n'+b''.join(f'252 {128+n} 16384 cnflasha{n}\n252 {n} 16384 pnflasha{n}\n'.encode() for n in NUMBERS)
+ boot_path='/proc/sys/kernel/random/boot_id';boot=b'11111111-2222-4333-8444-555555555555\n'
+ if case=='boot_short':boot=boot[:-1]
+ if case=='boot_overflow':boot+=b'X'
+ if case=='boot_uppercase':boot=b'abcdefab-2222-4333-8444-555555555555\n'.upper()
+ if case=='boot_zero':boot=b'00000000-0000-0000-0000-000000000000\n'
+ if case!='missing_boot':files[boot_path]=boot
  if case=='proc_overflow':proc=b'x'*65537
  if case!='missing_proc':files['/proc/partitions']=proc
  if case=='missing_START':files.pop(directory+'/start')
@@ -37,7 +45,7 @@ def emulate(job,case,m):
  for s in elf.iter_segments():
   if s['p_type']=='PT_LOAD':u.mem_write(s['p_vaddr'],s.data())
  u.mem_map(0x90000000,0x100000);sp=0x90080000;u.reg_write(UC_ARM64_REG_SP,sp);u.mem_write(sp,struct.pack('<4Q',2,sp+256,sp+300,0));u.mem_write(sp+256,b'worker\0');u.mem_write(sp+300,b'888\0')
- fds={};state=dict(next=3,exit=None,clock=0,interrupted=False,eintr=False,parent=0);counts=Counter();opens=[];stats=[];links=[];trace=[]
+ fds={};state=dict(next=3,exit=None,clock=0,interrupted=False,eintr=False,parent=0,boot_opens=0,boot_eintr=False);counts=Counter();opens=[];stats=[];links=[];trace=[]
  def text(at):return bytes(u.mem_read(at,512)).split(b'\0',1)[0].decode()
  def ret(value):u.reg_write(UC_ARM64_REG_X0,value&((1<<64)-1))
  def fault(path,kind):
@@ -47,7 +55,7 @@ def emulate(job,case,m):
   require(number==2,'SVC only');no=u.reg_read(UC_ARM64_REG_X8);args=[u.reg_read(UC_ARM64_REG_X0+i) for i in range(6)];a,b,c,d,e,f=args;counts[no]+=1;trace.append(no)
   if no==57:
    if a not in fds:ret(-9);return
-   path,pos,flags=fds.pop(a);ret(-5 if fault(path,'close') or (case=='proc_close_error' and path=='/proc/partitions') else 0)
+   path,pos,flags=fds.pop(a);ret(-5 if fault(path,'close') or (case=='proc_close_error' and path=='/proc/partitions') or (case=='boot_close_error' and path==boot_path) else 0)
   elif no in (172,173,175):
    if no==173:state['parent']+=1
    ret(777 if no==172 else (0 if case!='not_root' else 1000) if no==175 else (2 if case=='parent_never_settles' or (case=='transient_parent' and state['parent']<3) else 1))
@@ -58,8 +66,11 @@ def emulate(job,case,m):
   elif no==113:state['clock']+=1;u.mem_write(b,struct.pack('<2q',state['clock'],0));ret(0)
   elif no==101:ret(0)
   elif no==56:
-   path=text(b);opens.append(dict(path=path,flags=c));require(not path.startswith('/dev/') and (path=='/proc/partitions' or path.startswith(directory+'/')),'Forbidden open')
-   require(c==(0x88000 if path in ('/proc/partitions',directory+'/start') else 0x880c1),'Wrong open flags')
+   path=text(b);opens.append(dict(path=path,flags=c));require(not path.startswith('/dev/') and (path in ('/proc/partitions',boot_path) or path.startswith(directory+'/')),'Forbidden open')
+   require(c==(0x88000 if path in ('/proc/partitions',boot_path,directory+'/start') else 0x880c1),'Wrong open flags')
+   if path==boot_path:
+    state['boot_opens']+=1
+    if state['boot_opens']==2 and case=='boot_changed':files[boot_path]=b'66666666-2222-4333-8444-555555555555\n'
    if fault(path,'open'):ret(-5);return
    if c==0x880c1:
     if path in files:ret(-17);return
@@ -68,9 +79,11 @@ def emulate(job,case,m):
    fd=state['next'];state['next']+=1;fds[fd]=[path,0,c];ret(fd)
   elif no==63:
    path,pos,flags=fds[a]
+   if path==boot_path and (case=='boot_read_error' or (case=='boot_second_error' and state['boot_opens']==2)):ret(-5);return
+   if path==boot_path and case=='boot_eintr' and not state['boot_eintr']:state['boot_eintr']=True;ret(-4);return
    if path=='/proc/partitions' and case=='proc_error':ret(-5);return
    if path=='/proc/partitions' and case=='read_eintr' and not state['eintr']:state['eintr']=True;ret(-4);return
-   raw=files[path][pos:pos+min(c,17 if case=='positive_short_read' else c)];u.mem_write(b,raw);fds[a][1]+=len(raw);ret(len(raw))
+   raw=files[path][pos:pos+min(c,17 if case=='positive_short_read' or (case=='boot_positive_short_read' and path==boot_path) else c)];u.mem_write(b,raw);fds[a][1]+=len(raw);ret(len(raw))
   elif no==64:
    path,pos,flags=fds[a];require(path.startswith(directory+'/') and flags==0x880c1,'Non-output write')
    if fault(path,'write'):ret(-5);return
@@ -106,7 +119,7 @@ def emulate(job,case,m):
   require(hashlib.sha256(files[directory+'/partitions.bin']).digest()==ps and hashlib.sha256(files[directory+'/aliases.bin']).digest()==als,'Native SHA mismatch');require(not fds,'Native leaked FDs')
  else:require(state['exit']!=0 or state['interrupted'],'Fault false success')
  require(not counts[67] and not counts[68] and not counts[29] and not counts[117],'Forbidden process/block operations')
- return dict(case=case,passed=True,exit=state['exit'],interrupted=state['interrupted'],syscalls=dict(counts),opens=opens,readlink_calls=len(links),stat_calls=len(stats),block_opens=0,process_memory_writes=0,terminal_hex=final.hex() if final else None,
+ return dict(case=case,passed=True,exit=state['exit'],interrupted=state['interrupted'],syscalls=dict(counts),opens=opens,readlink_calls=len(links),stat_calls=len(stats),block_opens=0,process_memory_writes=0,boot_reads=state['boot_opens'],terminal_hex=final.hex() if final else None,
   ready_hex=files.get(directory+'/ready',b'').hex(),partitions_hex=files.get(directory+'/partitions.bin',b'').hex(),aliases_hex=files.get(directory+'/aliases.bin',b'').hex(),trace_sha256=hashlib.sha256(bytes(no%256 for no in trace)).hexdigest())
 def _base(job,m,verification,cases):
  return dict(all_passed=True,manifest_sha256=sha(job/'manifest.json'),verification_sha256=hashlib.sha256(json.dumps(verification,sort_keys=True,separators=(',',':'),allow_nan=False).encode()).hexdigest(),source_bindings=m['sources'],artifact_bindings=m['artifacts'],cases=list(cases),declared_cases=list(cases),coverage_complete_for_declared_matrix=True,debug_worker_sha256=sha(job/'worker.debug.elf'),emulator_sha256=sha(Path(__file__)),contract_sha256=sha(ROOT/'camera_install_runtime_metadata.py'),profile_sha256=sha(ROOT/'tools/install_runtime_metadata_profile.py'),hardware_operations=0,real_ARM_process=False,execution_kind='EMULATED_INSTRUCTIONS_ONLY')

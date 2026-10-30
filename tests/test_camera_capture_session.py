@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 import camera_capture_session as capture
 from camera_device_lease import CameraDeviceLease
 from camera_install_journal import InstallJournal
+from install_model_fixture import formal_complete
 
 
 def pdt_fixture():
@@ -84,9 +85,7 @@ class CaptureSessionTests(unittest.TestCase):
         return capture.capture_settings_before(self.body, self.group, **options)
 
     def complete(self):
-        for state in ('SD_STAGE_INTENT', 'SD_STAGED', 'READY_FOR_CONFIRMATION',
-                      'FLASH_MAY_HAVE_STARTED', 'DEVICE_COMPLETION_REPORTED'):
-            self.journal.advance(state)
+        formal_complete(self, self.journal)
 
     def after(self, **overrides):
         options = dict(plan_sha256=self.plan, journal=self.journal, lease=self.lease,

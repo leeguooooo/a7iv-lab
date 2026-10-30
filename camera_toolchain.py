@@ -31,7 +31,12 @@ TEST_MODULES=('test_camera_device_lease','test_camera_install_journal','test_cam
               'test_camera_install_patch_read_execution','test_camera_install_patch_read_session',
               'test_camera_install_card','test_camera_install_runtime',
               'test_camera_install_runtime_metadata','test_camera_install_runtime_session',
-              'test_camera_install_requirements','test_camera_install_runtime_command')
+              'test_camera_install_requirements','test_camera_install_runtime_command',
+              'test_camera_install_master_plan','test_camera_install_receipts','test_camera_install_admission',
+              'test_camera_install_completion','test_camera_install_cancel_session','test_camera_install_card_withdraw',
+              'test_camera_install_epoch_session','test_camera_install_epoch_cancel','test_camera_install_post_session',
+              'test_camera_install_features','test_camera_install_io','test_camera_install_flow',
+              'test_camera_install_operator','test_camera_install_bundle')
 
 
 def require(ok,message):
@@ -43,6 +48,29 @@ def sha(path):
 
 
 def read(path):return json.loads(Path(path).read_text())
+
+
+def original_plan_body(plan, *, require_preparation=False):
+    """Validate supported original-plan bindings without granting device entry."""
+    require(isinstance(plan,dict) and plan.get('local_checks_passed') is True
+            and plan.get('prepared_offline_only') is True
+            and plan.get('execution_approval_received') is False
+            and plan.get('model')=='ILCE-7M4'
+            and plan.get('package_sha256')==PACKAGE_SHA and plan.get('plaintext_sha256')==PLAIN_SHA,
+            'Pinned offline FL23 original plan required')
+    if plan.get('schema')=='camera-install-patch-session-plan/1':
+        require(plan.get('scope')=='INSTALL_PREPARATION_VOLATILE_PATCH_ONLY'
+                and all(plan.get(name) is False for name in
+                        ('installation_authorized','hardware_admission_proven','flash_authorized')),
+                'Preparation plan must not authorize firmware installation')
+        body=plan.get('body_sha256')
+    else:
+        require(not require_preparation and plan.get('schema')=='camera-offline-toolchain-plan/1',
+                'Exact preparation plan required for formal installation')
+        body=plan.get('reference_body_sha256')
+    require(type(body) is str and len(body)==64 and all(c in '0123456789abcdef' for c in body),
+            'Bound historical body SHA required')
+    return body
 
 
 def save(path,value):
@@ -273,6 +301,7 @@ def check(*,tests=False,install_volatile_job=None,install_patch_read_job=None,ru
              'camera_install_runtime_plan.py','camera_install_runtime_command.py','camera_install_requirements.py',
              'native/install_runtime_metadata.c')
     sources={ROOT/p for p in runtime}
+    sources|=set(ROOT.glob('camera_install*.py'))
     sources|={ROOT/'tools'/n for n in ('menu_window_profile.py','build_menu_window_offline.py',
                 'verify_menu_window_offline.py','emulate_menu_window_offline.py',
                 'model_toolchain_bootstraps_offline.py','fl23_prewrite_guard.py','fl23_prewrite_adapter.py')}
@@ -282,6 +311,8 @@ def check(*,tests=False,install_volatile_job=None,install_patch_read_job=None,ru
     sources|=set((ROOT/'tools').glob('*install_runtime_metadata*.py'))
     sources|=set((ROOT/'tests').glob('test_camera_*.py'))
     sources|=set((ROOT/'tests').glob('test_fl23_prewrite_*.py'))
+    sources|={ROOT/'tests/install_model_fixture.py'}
+    sources|={p for p in (ROOT/'Sony-PMCA-RE/pmca').rglob('*.py')}
     sources|=set(ROOT.glob('camera_stream*.py'))
     sources|={ROOT/'camera_inventory.py',ROOT/'ref/sony-a7m4-custom-firmware/a7m4/fat.py',
               ROOT/'ref/sony-a7m4-custom-firmware/a7m4/common.py',

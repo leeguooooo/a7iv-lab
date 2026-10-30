@@ -20,7 +20,7 @@ from camera_install_runtime_metadata import MetadataAssets
 from camera_install_runtime_session import (RuntimeAssets, preflight_assets, validate_review,
                                            run_runtime_session, require, REVIEW_SCHEMA)
 from camera_install_runtime_plan import seal
-from camera_toolchain import PLAIN, PACKAGE_SHA, PLAIN_SHA
+from camera_toolchain import PLAIN, PACKAGE_SHA, PLAIN_SHA, original_plan_body
 
 
 def _sha(path):
@@ -31,16 +31,8 @@ def _sha(path):
 def _base_plan(path, digest):
     raw, plan = _json(_local(path))
     require(hashlib.sha256(raw).hexdigest() == digest, 'Original local plan SHA differs')
-    require(plan.get('schema') == 'camera-offline-toolchain-plan/1'
-            and plan.get('local_checks_passed') is True and plan.get('prepared_offline_only') is True
-            and plan.get('execution_approval_received') is False
-            and plan.get('model') == 'ILCE-7M4'
-            and plan.get('package_sha256') == PACKAGE_SHA and plan.get('plaintext_sha256') == PLAIN_SHA,
-            'Pinned offline FL23 base plan required')
-    body = plan.get('reference_body_sha256')
-    require(type(body) is str and len(body) == 64 and all(c in '0123456789abcdef' for c in body),
-            'Bound historical body reference required')
-    return plan
+    body = original_plan_body(plan)
+    return plan | dict(reference_body_sha256=body)
 
 
 def assets_from_reference(reference):

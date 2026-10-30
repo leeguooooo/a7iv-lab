@@ -19,14 +19,21 @@ from camera_install_runtime import _partitions
 
 ROOT=Path(__file__).resolve().parent
 CLAIMS=ROOT/'output/install-runtime-metadata-nonce-claims'
-MAGIC=b'M4META01'
+MAGIC=b'M4META02'
+VERSION=2
+LEGACY_MAGIC=b'M4META01'
+BOOT_ID_BYTES=40
+ALIAS_BYTES=1768
+BOOT_ID_PATTERN=re.compile(rb'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z')
 START_MAGIC=b'M4MSTART'
 FRAME=struct.Struct('<8s16s11q32s32s')
 START_FRAME=struct.Struct('<8s16sQ')
 ALIAS=struct.Struct('<4Q128s128s')
 NUMBERS=(1,3,5,7,8,15)
+PRE_SCOPE='PRE_INSTALL_RUNTIME_METADATA_READ_ONLY'
+EPOCH_SCOPE='INSTALL_PATCH_PENDING_AP_BOOT_EPOCH_READ_ONLY'
 FIELDS=('version','phase','error','euid','pid','ppid','loader_pid','cleanup','flags','proc_bytes','alias_bytes')
-LENGTHS=dict(launch=104,ready=176,result=176,exec_failure=8,**{'partitions.bin':65536,'aliases.bin':1728})
+LENGTHS=dict(launch=104,ready=176,result=176,exec_failure=8,**{'partitions.bin':65536,'aliases.bin':ALIAS_BYTES})
 
 
 def require(ok,message):
@@ -124,12 +131,17 @@ def _context(lease,journal,body_sha256,plan_sha256):
         and current.binding==dict(body_sha256=body_sha256,plan_sha256=plan_sha256,model='ILCE-7M4'),'Current pre-RAM journal/body/plan required')
     assert_operation_allowed(journal,allowed_states=('PLANNED','SD_STAGED'))
     if journal.session_dir.parent.resolve()!=DEFAULT_SESSIONS.resolve():assert_operation_allowed(sessions_root=DEFAULT_SESSIONS)
-    return dict(lease_identity=identity,journal_event_sha256=current.events[-1]['event_sha256'],
+    return dict(scope=PRE_SCOPE,lease_identity=identity,journal_event_sha256=current.events[-1]['event_sha256'],
         body_sha256=body_sha256,plan_sha256=plan_sha256,session_dir=str(journal.session_dir))
 
 
 def reserve_assets(prepared,evidence,*,lease,journal,body_sha256,plan_sha256):
-    context=_context(lease,journal,body_sha256,plan_sha256)
+    return _reserve_assets(prepared,evidence,lambda:_context(lease,journal,body_sha256,plan_sha256))
+
+
+def _reserve_assets(prepared,evidence,context_check):
+    context=context_check()
+    require(prepared.manifest['nonce'] not in context.get('prior_nonces',()),'Epoch nonce reuses prior job')
     require(preflight_assets(prepared.assets)==prepared,'Assets changed before reservation')
     folder=_path(evidence);require(folder.is_dir() and not any(folder.iterdir()),'Fresh empty evidence folder required')
     record=dict(schema='camera-install-runtime-metadata-reservation/1',asset_reference=prepared.reference,
@@ -137,35 +149,45 @@ def reserve_assets(prepared,evidence,*,lease,journal,body_sha256,plan_sha256):
     _path(CLAIMS);CLAIMS.mkdir(parents=True,exist_ok=True,mode=0o700)
     paths=_claims(prepared)
     for path in paths:
-        require(_context(lease,journal,body_sha256,plan_sha256)==context,'Lease/history changed')
+        require(context_check()==context,'Lease/history changed')
         durable_new(path,record)
     return dict(record=record,**{key:dict(path=str(path),sha256=_hash(path.read_bytes())) for key,path in zip(('global_claim','job_claim'),paths)})
 
 
-def decode_frame(raw,*,nonce,loader_pid,phase):
+def decode_frame(raw,*,nonce,loader_pid,phase,forensic_legacy=False):
     require(type(raw) is bytes and len(raw)==FRAME.size,'Complete native metadata frame required')
     magic,observed,*values,proc_sha,alias_sha=FRAME.unpack(raw)
-    require(magic==MAGIC and observed==bytes.fromhex(nonce),'Metadata frame identity differs')
+    require((magic==MAGIC or (forensic_legacy is True and magic==LEGACY_MAGIC))
+        and observed==bytes.fromhex(nonce),'Metadata frame identity differs')
     row=dict(zip(FIELDS,values))
-    require(row['version']==1 and row['phase']==phase and row['error']==0 and row['euid']==0
+    require(row['version']==(1 if magic==LEGACY_MAGIC else VERSION) and row['phase']==phase and row['error']==0 and row['euid']==0
         and 1<row['pid']<=0x7fffffff and row['ppid']==1 and row['loader_pid']==loader_pid
         and row['cleanup']==0 and row['pid']!=loader_pid,'Native lifecycle differs')
     require(row['flags']==(13 if phase==1 else 61),'Metadata lifecycle flags differ')
     if phase==1:require(row['proc_bytes']==row['alias_bytes']==0 and proc_sha==alias_sha==bytes(32),'Ready already contains data')
-    else:require(0<row['proc_bytes']<=65536 and row['alias_bytes']==1728,'Bounded metadata sizes required')
+    else:require(0<row['proc_bytes']<=65536 and row['alias_bytes']==(1728 if magic==LEGACY_MAGIC else ALIAS_BYTES),'Bounded metadata sizes required')
     return row,proc_sha,alias_sha
 
 
-def validate_receipt(receipt,*,reference,reservation):
+def validate_receipt(receipt,*,reference,reservation,forensic_legacy=False):
     require(receipt['asset_reference']==reference and receipt['reservation']==reservation,'Receipt bindings differ')
     raw=receipt['raw_publications'];require(set(raw)=={'launch','ready','result'},'Full handshake required')
     loader=validate_launch(bytes.fromhex(raw['launch']),bytes.fromhex(reference['nonce']))
-    ready,_,_=decode_frame(bytes.fromhex(raw['ready']),nonce=reference['nonce'],loader_pid=loader,phase=1)
-    final,ps,als=decode_frame(bytes.fromhex(raw['result']),nonce=reference['nonce'],loader_pid=loader,phase=7)
-    require(final['pid']==ready['pid'],'Worker changed')
+    ready,_,_=decode_frame(bytes.fromhex(raw['ready']),nonce=reference['nonce'],loader_pid=loader,phase=1,forensic_legacy=forensic_legacy)
+    final,ps,als=decode_frame(bytes.fromhex(raw['result']),nonce=reference['nonce'],loader_pid=loader,phase=7,forensic_legacy=forensic_legacy)
+    require(final['version']==ready['version'] and final['pid']==ready['pid'],'Worker changed')
     proc=bytes.fromhex(receipt['partitions_raw_hex']);aliases=bytes.fromhex(receipt['aliases_raw_hex'])
-    require(len(proc)==final['proc_bytes'] and len(aliases)==1728 and hashlib.sha256(proc).digest()==ps
+    require(len(proc)==final['proc_bytes'] and len(aliases)==final['alias_bytes'] and hashlib.sha256(proc).digest()==ps
         and hashlib.sha256(aliases).digest()==als,'Native payload hash/size differs')
+    boot_id=None
+    if final['version']==VERSION:
+        boot=aliases[1728:]
+        require(len(boot)==BOOT_ID_BYTES and boot[36:]==bytes(4) and BOOT_ID_PATTERN.fullmatch(boot[:36])
+            and any(c!=ord('0') for c in boot[:36] if c!=ord('-')), 'Canonical nonzero boot UUID required')
+        boot_id=boot[:36].decode('ascii')
+    else:
+        require(forensic_legacy is True and receipt.get('source_is_hardware') is False,
+            'V1 metadata is forensic only and cannot declare hardware origin')
     rows=_partitions(proc);targets={};stats={}
     for index,number in enumerate(NUMBERS):
         n,length,mode,rdev,target,st=ALIAS.unpack_from(aliases,index*ALIAS.size)
@@ -180,7 +202,7 @@ def validate_receipt(receipt,*,reference,reservation):
         targets[name]=canonical;stats[name]=dict(raw_target_hex=target[:length].hex(),mode=mode,rdev=rdev,major=major,minor=minor)
     require(receipt.get('state')=='RUNTIME_METADATA_OBSERVED' and receipt.get('installation_authorized') is False
         and receipt.get('write_admission') is False and receipt.get('restoration_proven') is False,'Observation-only receipt required')
-    return dict(alias_targets=targets,alias_stats=stats,partitions_sha256=_hash(proc),aliases_sha256=_hash(aliases),loader_pid=loader,
+    return dict(alias_targets=targets,alias_stats=stats,boot_id=boot_id,metadata_version=final['version'],boot_epoch_available=boot_id is not None,partitions_sha256=_hash(proc),aliases_sha256=_hash(aliases),loader_pid=loader,
         source_is_hardware=False,write_admission=False,installation_authorized=False)
 
 
@@ -194,10 +216,10 @@ class MetadataChannel(BootstrapChannel):
         return self._packet(17,b'\0\xff\0',LENGTHS[name],missing)
     def start_once(self,evidence):
         require(not self.started,'START consumed');self.started=True;durable_new(Path(evidence)/'start-intent.json',dict(nonce=self.nonce.hex(),automatic_retry=False))
-        self._select('start');require(self._packet(16,b'\0\xff\0'+START_FRAME.pack(START_MAGIC,self.nonce,1),0)==b'','START response differs')
+        self._select('start');require(self._packet(16,b'\0\xff\0'+START_FRAME.pack(START_MAGIC,self.nonce,VERSION),0)==b'','START response differs')
 
 
-def capture_authenticated(device,evidence,*,assets,reservation,lease,journal,body_sha256,plan_sha256,
+def _capture_metadata(device,evidence,*,assets,reservation,lease,journal,body_sha256,plan_sha256,context_check,
         metadata_read_authorized=False,source_is_hardware=False,channel_factory=None,clock=time.monotonic,sleep=time.sleep):
     require(metadata_read_authorized is True,'Explicit metadata read authorization required')
     require(channel_factory is None or callable(channel_factory),'Callable injected channel required')
@@ -208,7 +230,7 @@ def capture_authenticated(device,evidence,*,assets,reservation,lease,journal,bod
     prepared=preflight_assets(assets,owned_reservation=reservation);folder=_path(evidence)
     record=reservation['record'];require(record['evidence']==str(folder),'Reservation evidence differs')
     def guard():
-        require(_context(lease,journal,body_sha256,plan_sha256)==record['context'],'Reserved lease/history changed')
+        require(context_check()==record['context'],'Reserved lease/history changed')
     guard();require(prepared.reference==record['asset_reference'],'Reserved assets differ')
     require(not any(folder.iterdir()),'Fresh evidence folder required')
     durable_new(folder/'execution-intent.json',dict(reservation=reservation,source_is_hardware=hardware,automatic_retry=False))
@@ -252,3 +274,85 @@ def capture_authenticated(device,evidence,*,assets,reservation,lease,journal,bod
         channel.healthy=False
         durable_new(folder/'metadata-unknown.json',dict(stage=stage,error_type=type(error).__name__,automatic_retry=False,source_is_hardware=hardware))
         raise
+
+
+def capture_authenticated(device,evidence,*,assets,reservation,lease,journal,body_sha256,plan_sha256,
+        metadata_read_authorized=False,source_is_hardware=False,channel_factory=None,clock=time.monotonic,sleep=time.sleep):
+    return _capture_metadata(device,evidence,assets=assets,reservation=reservation,lease=lease,journal=journal,
+        body_sha256=body_sha256,plan_sha256=plan_sha256,metadata_read_authorized=metadata_read_authorized,
+        source_is_hardware=source_is_hardware,channel_factory=channel_factory,clock=clock,sleep=sleep,
+        context_check=lambda:_context(lease,journal,body_sha256,plan_sha256))
+
+
+def _pending_epoch_sources(pending_reference,initial_runtime_reference,withdrawal_reference,*,binding,history,session_dir):
+    from camera_install_receipts import validate_completed_pending,validate_completed_runtime
+    from camera_install_card_withdraw import validate_withdrawal_receipt
+    pending=validate_completed_pending(pending_reference,binding=binding,history=history,session_dir=session_dir)
+    initial=validate_completed_runtime(initial_runtime_reference,binding=binding,history=history,session_dir=session_dir)
+    withdrawal=validate_withdrawal_receipt(withdrawal_reference,binding=binding,history=history,session_dir=session_dir,
+        pending_reference=pending_reference,stage_reference=withdrawal_stage_reference(withdrawal_reference))
+    intents=[i for i,event in enumerate(history) if event['state']=='INSTALL_PATCH_MAY_BE_ACTIVE']
+    require(len(intents)==1 and initial['ancestor_index']<intents[0]<pending['ancestor_index'],
+            'Initial boot observation must precede the original patch intent')
+    require(initial.get('metadata_version')==VERSION and isinstance(initial.get('boot_id'),str)
+            and BOOT_ID_PATTERN.fullmatch(initial['boot_id'].encode('ascii')),
+            'Original PRE_RAM metadata V2 boot UUID required')
+    old=pending['receipt']['asset_reference']
+    prior_nonces=[old['patch']['nonce'],*(old['captures'][name]['nonce'] for name in ('pre_app','pre_ufp')),
+        initial['receipt']['asset_reference']['metadata']['nonce']]
+    return dict(initial_boot_id=initial['boot_id'],prior_nonces=prior_nonces,sources_declared_hardware=all(
+        value['source_is_hardware'] is True for value in (pending,initial,withdrawal)))
+
+
+def withdrawal_stage_reference(withdrawal_reference):
+    from camera_install_cancel import _json_reference
+    return _json_reference(withdrawal_reference)[2]['stage_reference']
+
+
+def _pending_epoch_context(lease,journal,body_sha256,plan_sha256,*,pending_reference,initial_runtime_reference,
+        withdrawal_reference,operator_never_started_confirmed,summary):
+    from camera_install_cancel import _json_reference
+    require(operator_never_started_confirmed is True,'Explicit never-started-update confirmation required')
+    identity=_held_lease(lease)
+    require(isinstance(journal,InstallJournal),'Original pending journal required')
+    current=InstallJournal.open(journal.session_dir)
+    require(current.events==journal.events and current.state=='INSTALL_PATCH_AWAITING_OPERATOR_RECONNECT'
+        and current.binding==dict(body_sha256=body_sha256,plan_sha256=plan_sha256,model='ILCE-7M4')
+        and current.events[-1]['details'].get('install_patch_artifact')==pending_reference
+        and not any(e['state']=='FLASH_MAY_HAVE_STARTED' for e in current.events),
+        'Exact original pending no-FLASH context required')
+    for reference in (pending_reference,initial_runtime_reference,withdrawal_reference):_json_reference(reference)
+    assert_operation_allowed(journal,allowed_states=('INSTALL_PATCH_AWAITING_OPERATOR_RECONNECT',))
+    if journal.session_dir.parent.resolve()!=DEFAULT_SESSIONS.resolve():assert_operation_allowed(sessions_root=DEFAULT_SESSIONS)
+    return dict(scope=EPOCH_SCOPE,lease_identity=identity,journal_event_sha256=current.events[-1]['event_sha256'],
+        body_sha256=body_sha256,plan_sha256=plan_sha256,session_dir=str(journal.session_dir),
+        pending_reference=pending_reference,initial_runtime_reference=initial_runtime_reference,
+        withdrawal_reference=withdrawal_reference,operator_never_started_confirmed=True,**summary)
+
+
+def reserve_pending_epoch_assets(prepared,evidence,*,lease,journal,body_sha256,plan_sha256,
+        pending_reference,initial_runtime_reference,withdrawal_reference,operator_never_started_confirmed=False):
+    """Reserve only the exact pending preparation's AP epoch observation."""
+    require(operator_never_started_confirmed is True,'Explicit never-started-update confirmation required')
+    summary=_pending_epoch_sources(pending_reference,initial_runtime_reference,withdrawal_reference,
+        binding=journal.binding,history=journal.events,session_dir=journal.session_dir)
+    return _reserve_assets(prepared,evidence,lambda:_pending_epoch_context(lease,journal,body_sha256,plan_sha256,
+        pending_reference=pending_reference,initial_runtime_reference=initial_runtime_reference,
+        withdrawal_reference=withdrawal_reference,operator_never_started_confirmed=True,summary=summary))
+
+
+def capture_pending_epoch_authenticated(device,evidence,*,assets,reservation,lease,journal,body_sha256,plan_sha256,
+        pending_reference,initial_runtime_reference,withdrawal_reference,operator_never_started_confirmed=False,
+        metadata_read_authorized=False,source_is_hardware=False,channel_factory=None,clock=time.monotonic,sleep=time.sleep):
+    """Read fixed metadata while pending; never inspect original PIDs or reboot."""
+    require(operator_never_started_confirmed is True,'Explicit never-started-update confirmation required')
+    summary=_pending_epoch_sources(pending_reference,initial_runtime_reference,withdrawal_reference,
+        binding=journal.binding,history=journal.events,session_dir=journal.session_dir)
+    require(channel_factory is not None or summary['sources_declared_hardware'] is True,
+            'Default epoch collection requires trusted original runtime, pending and withdrawal sources')
+    return _capture_metadata(device,evidence,assets=assets,reservation=reservation,lease=lease,journal=journal,
+        body_sha256=body_sha256,plan_sha256=plan_sha256,metadata_read_authorized=metadata_read_authorized,
+        source_is_hardware=source_is_hardware,channel_factory=channel_factory,clock=clock,sleep=sleep,
+        context_check=lambda:_pending_epoch_context(lease,journal,body_sha256,plan_sha256,
+            pending_reference=pending_reference,initial_runtime_reference=initial_runtime_reference,
+            withdrawal_reference=withdrawal_reference,operator_never_started_confirmed=True,summary=summary))

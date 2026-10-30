@@ -3,6 +3,7 @@ from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -171,6 +172,20 @@ class ReadSessionTests(unittest.TestCase):
         self.run.side_effect = unknown
         with self.assertRaises(OSError):self.invoke()
         self.assertTrue((self.f.evidence / 'current-read-session-terminal.json').exists())
+        self.assertFalse((self.f.evidence / 'current-read-session-exit.json').exists())
+        self.assert_original_pending()
+
+    def test_driver_pin_prevents_STOP_after_lease_change_and_restores_host_pointer(self):
+        driver = SimpleNamespace(vendorRequestOut=Mock())
+        device = SimpleNamespace(driver=driver)
+        def changed_before_stop(body, work, **options):
+            work(device)
+            self.f.lease.__exit__(None, None, None);self.f.lease.__enter__()
+            device.driver.vendorRequestOut('synthetic-STOP')
+        self.run.side_effect = changed_before_stop
+        with self.assertRaises(ValueError):self.invoke()
+        driver.vendorRequestOut.assert_not_called()
+        self.assertIs(device.driver, driver)
         self.assertFalse((self.f.evidence / 'current-read-session-exit.json').exists())
         self.assert_original_pending()
 

@@ -2,12 +2,14 @@
 import hashlib
 from pathlib import Path
 from menu_window_profile import ROOT, APP, COMPILER, COMPILER_SHA, require, read_regular, sha, mapped
-SCHEMA='camera-install-runtime-metadata-offline/1'
-PROFILE='fixed_partition_alias_metadata'
+SCHEMA='camera-install-runtime-metadata-offline/2'
+PROFILE='fixed_partition_alias_metadata_v2_boot_epoch'
 HEADER=APP/'native/linux_a64.h'
 BOOTSTRAP=APP/'native/bootstrap.c'
 SHA_HEADER=APP/'writer/sha256.h'
-SOURCE_PATHS=('camera_device_lease.py','camera_install_journal.py','camera_operation_guard.py','camera_install_patch_session.py','camera_stream_execution.py','camera_stream_channel.py','camera_install_runtime.py','native/install_runtime_metadata.c','camera_install_runtime_metadata.py',
+SOURCE_PATHS=('camera_device_lease.py','camera_install_journal.py','camera_operation_guard.py','camera_install_patch_session.py','camera_stream_execution.py','camera_stream_channel.py','camera_install_runtime.py',
+ 'camera_install_receipts.py','camera_install_card_withdraw.py','camera_install_cancel.py','camera_install_cancel_session.py',
+ 'camera_install_epoch_session.py','camera_install_epoch_plan.py','camera_install_io.py','native/install_runtime_metadata.c','camera_install_runtime_metadata.py',
  'tools/install_runtime_metadata_profile.py','tools/build_install_runtime_metadata_offline.py',
  'tools/verify_install_runtime_metadata_offline.py','tools/emulate_install_runtime_metadata_offline.py')
 PINS={str(HEADER.relative_to(ROOT)):'827bfa50c9d5e2a1ee8eacc032303844cd3c0a8a9b4f5ea1bfa640a987eedd88',

@@ -227,6 +227,26 @@ def _critical_settings(root, references, binding, group_nonce, source, seen, for
             'all_calibration_verified': False, 'all_attribute_merge_semantics_verified': False}
 
 
+def verify_p1_semantics(raw, *, header, factory_kernel, boot_files):
+    """Check the receiver boot files and body metadata, without asserting a write branch."""
+    require(type(header) is bytes and len(header) == 512 and set(boot_files) == set(BOOT_FILES),
+            'Complete pinned P1 semantic references required')
+    p1 = _fat(raw)
+    initrd, kernel = p1.read('boot/initrd.img'), p1.read('boot/vmlinux.bin')
+    expected_sum = (hashlib.md5(kernel).hexdigest() + '  ./boot/vmlinux.bin\n' +
+                    hashlib.md5(initrd).hexdigest() + '  ./boot/initrd.img\n').encode('ascii')
+    require(sha(initrd) == INITRD_SHA and kernel == factory_kernel, 'P1 initrd/kernel mismatch')
+    require(p1.read('P1CHKSUM') == expected_sum, 'P1CHKSUM mismatch')
+    require(p1.read('DAT2') == header[36:40] and p1.read('DAT3') == header[40:44],
+            'P1 DAT2/DAT3 model/region mismatch')
+    require(all(p1.read(name) == expected for name, expected in boot_files.items()),
+            'P1 device-tree or boot configuration mismatch')
+    return dict(initrd_sha256=sha(initrd), kernel_sha256=sha(kernel),
+                boot_files={name: sha(value) for name, value in boot_files.items()},
+                model_bytes=header[36:40].hex(), region_bytes=header[40:44].hex(),
+                nwu_branch_execution_proven=False)
+
+
 def verify_capture_run(run_path, *, plan_sha256, body_sha256, model, group_nonce,
                        source_is_hardware=False, plain_path=PLAIN,
                        factory_p1_path=FACTORY_P1, offline_candidates=()):
@@ -282,17 +302,9 @@ def verify_capture_run(run_path, *, plan_sha256, body_sha256, model, group_nonce
                                     source_is_hardware, seen, forbidden)
             captures[profile] = raw
             result['checks'][profile] = summary
-        p1 = _fat(captures['post_p1'])
-        initrd, kernel = p1.read('boot/initrd.img'), p1.read('boot/vmlinux.bin')
-        expected_sum = (hashlib.md5(kernel).hexdigest() + '  ./boot/vmlinux.bin\n' +
-                        hashlib.md5(initrd).hexdigest() + '  ./boot/initrd.img\n').encode('ascii')
-        require(sha(initrd) == INITRD_SHA and kernel == factory_kernel, 'P1 initrd/kernel mismatch')
-        require(p1.read('P1CHKSUM') == expected_sum, 'P1CHKSUM mismatch')
-        require(p1.read('DAT2') == header[36:40] and p1.read('DAT3') == header[40:44],
-                'P1 DAT2/DAT3 model/region mismatch')
-        require(all(p1.read(name) == expected for name, expected in boot_files.items()),
-                'P1 device-tree or boot configuration mismatch')
-        result['checks']['p1_boot_files'] = {name: sha(raw) for name, raw in boot_files.items()}
+        semantics = verify_p1_semantics(captures['post_p1'], header=header,
+                                       factory_kernel=factory_kernel, boot_files=boot_files)
+        result['checks']['p1_boot_files'] = semantics['boot_files']
         result['checks']['p1_semantics'] = True
         result['checks']['critical_settings'] = _critical_settings(
             root, run['critical_settings'], binding, group_nonce, source_is_hardware, seen, forbidden, template)

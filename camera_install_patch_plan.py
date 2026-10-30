@@ -76,6 +76,14 @@ def assets_from_directories(patch_job, capture_directory):
     return patch, captures
 
 
+def _candidate_package_check():
+    from camera_toolchain import check
+    report = check(tests=False)
+    require(report.get('local_checks_passed') is True and report.get('hardware_operations_by_this_check') == 0,
+            'Complete offline candidate checks required')
+    return {name: report[name] for name in ('package_sha256', 'plaintext_sha256', 'local_checks_passed')}
+
+
 def seal(output, *, assets, capture_assets, body_reference):
     """Snapshot reviewed sources and publish a fresh plan, never a device intent."""
     output = _local(output, directory=True, existing=False)
@@ -87,6 +95,7 @@ def seal(output, *, assets, capture_assets, body_reference):
             and isinstance(body.get('usb_serial_sha256'), str)
             and SHA.fullmatch(body['usb_serial_sha256']), 'Bound historical body reference required')
     prepared = preflight_assets(assets, capture_assets)
+    package = _candidate_package_check()
     names = set(review_source_paths()) | set(prepared.manifest['sources'])
     sources = {}
     for name in sorted(names):
@@ -112,6 +121,7 @@ def seal(output, *, assets, capture_assets, body_reference):
         source_only_runtime=dict(SOURCE_ONLY_RUNTIME), installation_authorized=False,
         hardware_admission_proven=False, flash_authorized=False,
         execution_approval_received=False, hardware_operations=0)
+    payload.update(package, prepared_offline_only=True)
     pending = output / 'plan.pending.json'
     raw = (json.dumps(payload, sort_keys=True, indent=2, allow_nan=False) + '\n').encode()
     _write(pending, raw)

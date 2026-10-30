@@ -20,6 +20,7 @@ from camera_capture_session import read_pdt_bounded
 from camera_device_lease import DEFAULT_LOCK
 from camera_firmware_capture import checked_capture_assets, capture_one_authenticated, CLAIMS as CAPTURE_CLAIMS
 from camera_install_journal import InstallJournal
+from camera_install_io import PinnedDriver as _PinnedDriver
 from camera_install_patch_session import (SOURCE_ONLY_RUNTIME, _source_only_runtime, _held_lease,
     _safe_path, _json, _known_stop, canonical_sha256, review_source_paths as preparation_sources)
 from camera_operation_guard import DEFAULT_SESSIONS, assert_operation_allowed
@@ -179,26 +180,6 @@ def _barrier(journal):
     assert_operation_allowed(journal, allowed_states=STATES)
     if journal.session_dir.parent.resolve() != Path(GLOBAL_SESSIONS).resolve():
         assert_operation_allowed(sessions_root=GLOBAL_SESSIONS)
-
-
-class _PinnedDriver:
-    """Delegate existing driver operations while retaining one lease/history pin."""
-    def __init__(self, original, guard):
-        self.original, self.guard, self.failed = original, guard, False
-
-    def __getattr__(self, name):
-        value = getattr(self.original, name)
-        if not callable(value):
-            return value
-        def invoke(*args, **kwargs):
-            require(not self.failed, 'Runtime driver already stopped')
-            try:
-                self.guard()
-                return value(*args, **kwargs)
-            except BaseException:
-                self.failed = True
-                raise
-        return invoke
 
 
 def _save_raw(path, raw):

@@ -31,17 +31,20 @@ STATES = frozenset({
     'CANCELLED_BEFORE_DEVICE_WRITE', 'MANUALLY_RECONCILED_SAFE', 'RAM_RESTORATION_VERIFIED',
     'LOCAL_REJECTED_BEFORE_DEVICE_ENTRY',
     'INSTALL_PATCH_MAY_BE_ACTIVE', 'INSTALL_PATCH_AWAITING_OPERATOR_RECONNECT',
+    'INSTALL_READY_FOR_OPERATOR_START', 'INSTALL_PREPARATION_CANCELLED',
 })
 TERMINAL_SAFE = frozenset({'CONTENT_VERIFIED', 'CANCELLED_BEFORE_DEVICE_WRITE',
                            'MANUALLY_RECONCILED_SAFE', 'RAM_RESTORATION_VERIFIED',
-                           'LOCAL_REJECTED_BEFORE_DEVICE_ENTRY'})
+                           'LOCAL_REJECTED_BEFORE_DEVICE_ENTRY', 'INSTALL_PREPARATION_CANCELLED'})
 NEXT = {
     'PLANNED': {'SD_STAGE_INTENT'},
     'SD_STAGE_INTENT': {'SD_STAGED'},
     'SD_STAGED': {'RAM_MAY_BE_ACTIVE', 'READY_FOR_CONFIRMATION', 'INSTALL_PATCH_MAY_BE_ACTIVE'},
     'INSTALL_PATCH_MAY_BE_ACTIVE': {'INSTALL_PATCH_AWAITING_OPERATOR_RECONNECT'},
+    'INSTALL_PATCH_AWAITING_OPERATOR_RECONNECT': {'INSTALL_READY_FOR_OPERATOR_START', 'INSTALL_PREPARATION_CANCELLED'},
+    'INSTALL_READY_FOR_OPERATOR_START': {'FLASH_MAY_HAVE_STARTED'},
     'RAM_MAY_BE_ACTIVE': {'READY_FOR_CONFIRMATION', 'RAM_AWAITING_OPERATOR_RECONNECT'},
-    'READY_FOR_CONFIRMATION': {'FLASH_MAY_HAVE_STARTED'},
+    'READY_FOR_CONFIRMATION': set(),
     'FLASH_MAY_HAVE_STARTED': {'DEVICE_COMPLETION_REPORTED'},
     'DEVICE_COMPLETION_REPORTED': {'CONTENT_VERIFIED'},
 }
@@ -180,6 +183,46 @@ def _install_patch_details(details, binding, history):
     return report
 
 
+FORMAL_ARTIFACTS = {
+    'INSTALL_READY_FOR_OPERATOR_START': 'admission_artifact',
+    'FLASH_MAY_HAVE_STARTED': 'start_intent_artifact',
+    'DEVICE_COMPLETION_REPORTED': 'device_completion_artifact',
+    'INSTALL_PREPARATION_CANCELLED': 'cancellation_artifact',
+}
+
+
+def _formal_details(state, details, binding, history, session_dir):
+    if state not in FORMAL_ARTIFACTS:
+        return
+    try:
+        return _validate_formal_details(state, details, binding, history, session_dir)
+    except JournalError:
+        raise
+    except (ValueError, OSError, KeyError, TypeError) as error:
+        raise JournalError('Invalid formal installation evidence: ' + str(error)) from error
+
+
+def _validate_formal_details(state, details, binding, history, session_dir):
+    from camera_install_receipts import load_reference, canonical, sha
+    reference = details.get(FORMAL_ARTIFACTS[state])
+    _, report = load_reference(reference)
+    _require(details.get('complete_receipt_sha256') == sha(canonical(report)),
+             'Complete formal receipt payload changed')
+    if state == 'INSTALL_READY_FOR_OPERATOR_START':
+        from camera_install_admission import validate_admission_receipt
+        validate_admission_receipt(reference, binding, history, session_dir)
+    elif state == 'FLASH_MAY_HAVE_STARTED':
+        from camera_install_admission import validate_start_intent
+        validate_start_intent(reference, binding, history, session_dir)
+    elif state == 'DEVICE_COMPLETION_REPORTED':
+        from camera_install_completion import validate_completion_receipt
+        validate_completion_receipt(reference, binding, history, session_dir)
+    else:
+        _require(details.get('explicit_user_approval') is True, 'Explicit preparation cancellation approval required')
+        from camera_install_cancel_session import validate_cancellation_receipt
+        validate_cancellation_receipt(reference, binding, history, session_dir)
+
+
 def _manual_reconciliation(reference, binding, history):
     report = _verification(reference, binding)
     _require(bool(history) and history[-1]['state'] == 'STOPPED_UNKNOWN',
@@ -285,6 +328,7 @@ class InstallJournal:
                 _require(isinstance(event['state'], str) and event['state'] in STATES, 'Invalid state')
                 _require(isinstance(event['details'], dict), 'Invalid details')
                 _transition(events, event['state'])
+                _formal_details(event['state'], event['details'], event['binding'], events, folder)
                 if event['state'] == 'CONTENT_VERIFIED':
                     _verification(event['details'].get('verification_artifact'), event['binding'])
                 if event['state'] == 'RAM_RESTORATION_VERIFIED':
@@ -318,7 +362,36 @@ class InstallJournal:
         _require(state != 'LOCAL_REJECTED_BEFORE_DEVICE_ENTRY', 'Use record_local_rejection with an artifact')
         _require(state != 'INSTALL_PATCH_AWAITING_OPERATOR_RECONNECT',
                  'Use record_install_patch_awaiting_reconnect with a complete artifact')
+        _require(state not in FORMAL_ARTIFACTS, 'Use the dedicated artifact method for formal installation phases')
         return self._append(state, {} if details is None else details)
+
+    def _record_formal(self, state, artifact_path, **extra):
+        from camera_install_receipts import safe_path, load_reference, canonical, sha
+        path = safe_path(artifact_path)
+        raw = path.read_bytes()
+        reference = dict(path=str(path), sha256=sha(raw))
+        _, report = load_reference(reference)
+        details = {FORMAL_ARTIFACTS[state]: reference,
+                   'complete_receipt_sha256': sha(canonical(report)), **extra}
+        return self._append(state, details)
+
+    def record_install_admission(self, artifact_path):
+        """Record validated full-install admission; no operator start has occurred."""
+        return self._record_formal('INSTALL_READY_FOR_OPERATOR_START', artifact_path)
+
+    def record_flash_may_have_started(self, artifact_path):
+        """Persist the approved manual-start boundary before displaying its instruction."""
+        return self._record_formal('FLASH_MAY_HAVE_STARTED', artifact_path)
+
+    def record_device_completion(self, artifact_path):
+        """Record explicit operator completion and normal-service re-entry permission."""
+        return self._record_formal('DEVICE_COMPLETION_REPORTED', artifact_path)
+
+    def record_install_preparation_cancelled(self, artifact_path, *, explicit_user_approval=False):
+        """Close preparation by current-state evidence, without claiming old-mm restoration."""
+        _require(explicit_user_approval is True, 'Explicit preparation cancellation approval required')
+        return self._record_formal('INSTALL_PREPARATION_CANCELLED', artifact_path,
+                                   explicit_user_approval=True)
 
     def record_install_patch_awaiting_reconnect(self, artifact_path):
         """Record a complete preparation receipt while keeping all work blocked."""
@@ -391,6 +464,7 @@ class InstallJournal:
             current = self.open(self.session_dir)
             _require(current._events == self._events, 'Stale journal instance; refusing automatic advance')
         binding = self.binding if self._events else initial_binding
+        _formal_details(state, details, binding, self._events, self.session_dir)
         event = dict(schema=1, session_id=self.session_dir.name, seq=len(self._events) + 1,
                      prev_sha256=self._events[-1]['event_sha256'] if self._events else ZERO_SHA,
                      binding=binding, state=state, details=deepcopy(details))

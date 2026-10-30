@@ -8,6 +8,7 @@ import camera_install_patch_read as contract
 import camera_install_patch_read_execution as execution
 from camera_device_lease import DEFAULT_LOCK
 from camera_install_journal import InstallJournal
+from camera_install_io import PinnedDriver
 from camera_install_patch_session import (SOURCE_ONLY_RUNTIME, _source_only_runtime, _safe_path,
     _held_lease, _json, _known_stop, canonical_sha256, review_source_paths as preparation_sources)
 from camera_operation_guard import DEFAULT_SESSIONS
@@ -93,6 +94,7 @@ def run_current_read_session(expected_body_sha256, evidence, *, plan_sha256, pen
     folder = Path(evidence).absolute()
     stage, claim_attempted, attempted = 'LOCAL_PREFLIGHT', False, False
     reservation, identity = None, None
+    installed = None
     try:
         require(read_authorized is True, 'Explicit current-read-only consent required')
         require((run_session is None) == (start_fn is None), 'Session and read runner must both be injected or both default')
@@ -141,10 +143,17 @@ def run_current_read_session(expected_body_sha256, evidence, *, plan_sha256, pen
             nonlocal stage
             stage = value
         def work(device):
-            nonlocal accepted, terminal_ref, calls
+            nonlocal accepted, terminal_ref, calls, installed
             calls += 1
             require(calls == 1, 'Current-read callback cannot be replayed')
             guard()
+            if hasattr(device, 'driver'):
+                original = device.driver
+                device.driver = PinnedDriver(original,
+                    lambda: execution._same_context(prepared, lease, journal, identity))
+                installed = (device, original)
+            else:
+                require(injected, 'Actual service driver required')
             observed = start_fn(device, folder, assets=assets, reservation=reservation,
                 pending_reference=pending_reference, lease=lease, journal=journal,
                 expected_body_sha256=expected_body_sha256, plan_sha256=plan_sha256,
@@ -197,3 +206,6 @@ def run_current_read_session(expected_body_sha256, evidence, *, plan_sha256, pen
         except BaseException:
             pass
         raise
+    finally:
+        if installed is not None:
+            installed[0].driver = installed[1]
