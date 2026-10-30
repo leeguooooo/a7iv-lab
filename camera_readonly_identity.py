@@ -369,6 +369,11 @@ def validate_receipt(receipt, operation):
     require(receipt.get('source_is_hardware') is (operation['context']['origin'] == 'HARDWARE'),
             'Receipt cannot assert a different origin')
     reference = operation['asset_reference']
+    observation = receipt.get('terminal_observation')
+    raw_folder = operation['evidence']
+    if observation is not None:
+        validate_terminal_observation(observation, operation)
+        raw_folder = observation['evidence']
     pubs = receipt['raw_publications']
     require(set(pubs) == {'launch', 'ready', 'result'}, 'Full raw handshake required')
     raws = {}
@@ -379,7 +384,7 @@ def validate_receipt(receipt, operation):
         require(set(value) == {'raw_hex', 'bytes'} and type(value['bytes']) is int, 'Raw envelope differs')
         raws[name] = bytes.fromhex(value['raw_hex'])
         require(len(raws[name]) == value['bytes'], 'Raw length differs')
-        require(safe_path(item['path']).parent == safe_path(operation['evidence']), 'Mixed evidence folders')
+        require(safe_path(item['path']).parent == safe_path(raw_folder), 'Mixed evidence folders')
     historical_lifecycle_v1(raws['launch'], raws['ready'], reference['nonce'])
     contract = validate_history(operation['reservation']['record']['historical_snapshot'], reference)
     decoded = decode_result(raws['result'], reference, historical_contract=contract)
@@ -424,8 +429,14 @@ def validate_journal_details(state, details, binding, history, session_dir):
     if state == OBSERVED:
         item = details['receipt']
         raw, receipt = read_json(item['path'])
-        require(sha(raw) == item['sha256'] and safe_path(item['path']).parent == safe_path(operation['evidence']),
+        require(sha(raw) == item['sha256'] and safe_path(item['path']).parent ==
+                safe_path(receipt.get('terminal_observation', {}).get('evidence', operation['evidence'])),
                 'RO receipt reference changed')
+        if history[-1]['state'] == UNKNOWN:
+            require(receipt.get('terminal_observation', {}).get('unknown_event_sha256') ==
+                    history[-1]['event_sha256'], 'Late observation must bind exact UNKNOWN event')
+        else:
+            require('terminal_observation' not in receipt, 'Initial capture cannot use late observation')
         validate_receipt(receipt, operation)
 
 
@@ -531,4 +542,168 @@ def capture_authenticated(device, evidence, *, assets, reservation, lease, journ
         # of which block every participating tool. Never clear or replay either.
         if journal.state == MAY:
             journal.advance(UNKNOWN, details=dict(scope=SCOPE, operation=operation))
+        raise
+
+
+class TerminalObservationChannel(IdentityChannel):
+    """Read the old job's terminal publications only; no executable upload path."""
+    def read(self, name, missing=False):
+        require(name in ('launch', 'ready', 'result'), 'Existing terminal publications only')
+        return super().read(name, missing=missing)
+
+    def read_loader(self, path):
+        require(path == SLOT, 'Only observe the fixed upload slot')
+        return super().read_loader(path)
+
+    def upload_once(self, *args, **kwargs):
+        raise ValueError('Late observer cannot upload or execute')
+
+    def start_once(self, *args, **kwargs):
+        raise ValueError('Late observer cannot START')
+
+    def assert_job_absent(self):
+        raise ValueError('Late observer reads an existing job only')
+
+
+def terminal_observation_payload(journal, context, evidence, observation_nonce):
+    """Review data for a new one-shot read; never reuses capture authorization."""
+    valid_nonce(observation_nonce)
+    require(journal.state == UNKNOWN, 'Only an existing UNKNOWN RO job may be observed')
+    operation = journal.events[-1]['details']['operation']
+    original = operation['context']
+    require(isinstance(context, CaptureContext) and context.target_id == original['target_id']
+            and context.origin == original['origin'], 'Original target and source classification required')
+    require(observation_nonce != operation['asset_reference']['nonce'], 'Separate observation attempt nonce required')
+    return dict(scope='RO_METADATA_EXISTING_TERMINAL_ONLY', observation_nonce=observation_nonce,
+                unknown_event_sha256=journal.events[-1]['event_sha256'], operation_sha256=sha(canonical(operation)),
+                target_id=context.target_id, origin=context.origin, evidence=str(safe_path(evidence)),
+                host_sources=host_source_bindings(), attempts=1, automatic_retry=False,
+                allowed_reads=[operation['asset_reference']['job_dir'] + '/' + name
+                               for name in ('launch', 'ready', 'result')] + [SLOT],
+                upload_authorized=False, START_authorized=False, installation_authorized=False)
+
+
+def validate_terminal_observation(observation, operation):
+    require(set(observation) == {'schema', 'evidence', 'unknown_event_sha256', 'context',
+            'approval', 'attempt_reference', 'source_reference', 'slot_reference'}, 'Exact terminal observer envelope required')
+    require(observation['schema'] == 'camera-readonly-identity-terminal-observation/1', 'Unknown observer schema')
+    original = operation['context']
+    observed = observation['context']
+    require({key: value for key, value in observed.items() if key != 'lease_identity'} ==
+            {key: value for key, value in original.items() if key != 'lease_identity'},
+            'Terminal observer changed original target/source/history')
+    approval = observation['approval']
+    require(set(approval) == {'operator', 'explicit_approval', 'binding'} and
+            type(approval['operator']) is str and 0 < len(approval['operator'].strip()) <= 120
+            and approval['explicit_approval'] is True, 'Separate explicit observation approval required')
+    binding = approval['binding']
+    valid_nonce(binding['observation_nonce'])
+    expected_reads = [operation['asset_reference']['job_dir'] + '/' + name
+                      for name in ('launch', 'ready', 'result')] + [SLOT]
+    require(binding == dict(scope='RO_METADATA_EXISTING_TERMINAL_ONLY',
+            observation_nonce=binding['observation_nonce'], unknown_event_sha256=observation['unknown_event_sha256'],
+            operation_sha256=sha(canonical(operation)), target_id=original['target_id'], origin=original['origin'],
+            evidence=observation['evidence'], host_sources=binding['host_sources'], attempts=1,
+            automatic_retry=False, allowed_reads=expected_reads, upload_authorized=False,
+            START_authorized=False, installation_authorized=False), 'Observer approval binding differs')
+    source = observation['source_reference']
+    raw, sources = read_json(source['path'])
+    require(sha(raw) == source['sha256'] and safe_path(source['path']).parent == safe_path(observation['evidence'])
+            and set(sources) == set(binding['host_sources']) and
+            all(sha(bytes.fromhex(value)) == binding['host_sources'][name] for name, value in sources.items()),
+            'Sealed observer source closure changed')
+    slot = observation['slot_reference']
+    raw, value = read_json(slot['path'])
+    require(sha(raw) == slot['sha256'] and safe_path(slot['path']).parent == safe_path(observation['evidence'])
+            and value == dict(path='/tmp/jiritsu/libJit.so', absent=True, raw_hex=None),
+            'Terminal slot absence observation differs')
+    attempt = observation['attempt_reference']
+    raw, intent = read_json(attempt['path'])
+    require(sha(raw) == attempt['sha256'] and intent == dict(schema='camera-readonly-terminal-attempt/1',
+            context=observed, approval=approval, source_reference=source, automatic_retry=False),
+            'One-shot observation intent changed')
+
+
+def observe_existing_terminal_authenticated(device, evidence, *, lease, journal, context, approval,
+                                             observation_nonce, channel):
+    """One separately approved read attempt; never uploads, STARTs or cleans up.
+
+    A new approval/attempt nonce is required for any later observation. Replaying
+    an attempt is forbidden, including after missing or uncertain reads. Neither
+    elapsed time nor lease closure nor a healthy camera closes UNKNOWN.
+    """
+    bound = context_binding(context, device, lease, journal, (UNKNOWN,))
+    operation = journal.events[-1]['details']['operation']
+    unknown_event = journal.events[-1]['event_sha256']
+    expected = terminal_observation_payload(journal, context, evidence, observation_nonce)
+    require(type(approval) is dict and set(approval) == {'operator', 'explicit_approval', 'binding'}
+            and type(approval['operator']) is str and 0 < len(approval['operator'].strip()) <= 120
+            and approval['explicit_approval'] is True and approval['binding'] == expected,
+            'Fresh exact terminal-observation approval required')
+    original = operation['context']
+    require({key: value for key, value in bound.items() if key != 'lease_identity'} ==
+            {key: value for key, value in original.items() if key != 'lease_identity'},
+            'Same original target/source/history required')
+    if context.origin == 'SIMULATED':
+        require(not isinstance(channel, StreamFileChannel), 'Physical transport cannot be classified as a simulated model')
+    else:
+        require(type(channel) is TerminalObservationChannel, 'Exact read-only terminal channel required')
+    nonce = operation['asset_reference']['nonce']
+    require(getattr(channel, 'device', None) is device and channel.nonce == bytes.fromhex(nonce)
+            and channel.directory == operation['asset_reference']['job_dir'] and channel.healthy is True,
+            'Channel must bind the original job and authenticated device')
+    folder = safe_path(evidence)
+    require(folder.is_dir() and not any(folder.iterdir()), 'Fresh observation evidence folder required')
+    contract = validate_history(operation['reservation']['record']['historical_snapshot'], operation['asset_reference'])
+    def guard():
+        require(context_binding(context, device, lease, journal, (UNKNOWN,)) == bound
+                and journal.events[-1]['event_sha256'] == unknown_event
+                and host_source_bindings() == expected['host_sources'], 'Observer lease/history/source changed')
+    channel.context_guard = guard
+    sources = folder / 'observer-sources.json'
+    durable_new(sources, {name: safe_path(ROOT / name).read_bytes().hex() for name in expected['host_sources']})
+    source_reference = dict(path=str(sources), sha256=sha(sources.read_bytes()))
+    # A consumed attempt remains consumed even if the first read is missing or unknown.
+    claim_root = safe_path(Path(operation['reservation']['claim']['path']).parent)
+    attempt_path = claim_root / (nonce + '.terminal-' + observation_nonce + '.json')
+    durable_new(attempt_path, dict(schema='camera-readonly-terminal-attempt/1', context=bound,
+                approval=approval, source_reference=source_reference, automatic_retry=False))
+    observation = dict(schema='camera-readonly-identity-terminal-observation/1', evidence=str(folder),
+            unknown_event_sha256=unknown_event, context=bound, approval=approval,
+            source_reference=source_reference,
+            attempt_reference=dict(path=str(attempt_path), sha256=sha(attempt_path.read_bytes())))
+    try:
+        raws, publications = {}, {}
+        for name, maximum in (('launch', 104), ('ready', 128), ('result', 200000)):
+            guard()
+            raw = channel.read(name, missing=True)
+            if raw is None:
+                raise ValueError('Existing terminal publication missing; UNKNOWN remains')
+            require(type(raw) is bytes and len(raw) <= maximum, 'Bounded terminal publication required')
+            path = folder / (name + '-raw.json')
+            durable_new(path, dict(raw_hex=raw.hex(), bytes=len(raw)))
+            publications[name] = dict(path=str(path), sha256=sha(path.read_bytes()))
+            raws[name] = raw
+        guard()
+        slot = channel.read_loader(SLOT)
+        require(slot is None or (type(slot) is bytes and len(slot) <= 65520), 'Bounded slot observation required')
+        slot_path = folder / 'slot-observation.json'
+        durable_new(slot_path, dict(path=SLOT, absent=slot is None, raw_hex=None if slot is None else slot.hex()))
+        observation['slot_reference'] = dict(path=str(slot_path), sha256=sha(slot_path.read_bytes()))
+        require(slot is None, 'Fixed upload slot cleanup remains unconfirmed')
+        historical_lifecycle_v1(raws['launch'], raws['ready'], nonce)
+        decoded = decode_result(raws['result'], operation['asset_reference'], historical_contract=contract)
+        receipt = dict(schema='camera-readonly-identity-receipt/1', state=OBSERVED, scope=SCOPE,
+                operation=operation, terminal_observation=observation, raw_publications=publications,
+                decoded=decoded, source_is_hardware=context.origin == 'HARDWARE', automatic_retry=False,
+                full_image_admission=False, identity_admission=False, firmware_admission=False)
+        validate_receipt(receipt, operation)
+        path = folder / 'readonly-identity-receipt.json'
+        durable_new(path, receipt)
+        guard()
+        journal.advance(OBSERVED, details=dict(scope=SCOPE, operation=operation,
+                receipt=dict(path=str(path), sha256=sha(path.read_bytes()))))
+        return receipt
+    except BaseException:
+        channel.healthy = False
         raise

@@ -84,7 +84,20 @@ A validated raw receipt closes only this observation as `RO_METADATA_OBSERVED`.
 Any uncertain outcome remains `RO_METADATA_UNKNOWN` (or durable MAY if recording
 UNKNOWN fails), blocking later operations through the existing global guard
 after lease release. RO history cannot use install cancellation/reconciliation
-or transition to RAM/flash authorization. The receipt proves neither firmware,
+or transition to RAM/flash authorization. A separately approved
+`observe_existing_terminal_authenticated` attempt can read an UNKNOWN job's
+original launch/ready/result and fixed slot, using a fresh guarded channel and
+current lease. `TerminalObservationChannel` has no upload, START, re-execution,
+STOP, reset, delete or cleanup API. Its raw publications and slot observation
+are saved before validation with the sealed historical decoder. Only complete
+same-operation success can transition UNKNOWN to OBSERVED; missing, malformed,
+uncertain, wrong-target or wrong-source observations retain UNKNOWN. Approval
+binds the exact UNKNOWN event, target/source, current source closure, evidence
+path and a separate attempt nonce. The intent consumes that nonce before I/O;
+replaying an attempt is forbidden. A later read requires a new explicit approval
+and attempt nonce. Old capture consent and the old held lease are never reused.
+The successful observer receipt seals its current source bytes and records its
+current lease separately, preserving historical replay after future updates. The receipt proves neither firmware,
 device identity nor image admission. Missing optional sources, including the
 frozen worker's `/proc/sys/kernel/module_sig_enforce` path, remain unknown and
 are never positive module-load admission. The separate native probe's sysfs

@@ -40,6 +40,7 @@ TERMINAL_SAFE = frozenset({'RO_METADATA_OBSERVED', 'CONTENT_VERIFIED', 'CANCELLE
 NEXT = {
     'PLANNED': {'SD_STAGE_INTENT', 'RO_METADATA_MAY_BE_ACTIVE'},
     'RO_METADATA_MAY_BE_ACTIVE': {'RO_METADATA_OBSERVED', 'RO_METADATA_UNKNOWN'},
+    'RO_METADATA_UNKNOWN': {'RO_METADATA_OBSERVED'},
     'SD_STAGE_INTENT': {'SD_STAGED'},
     'SD_STAGED': {'RAM_MAY_BE_ACTIVE', 'READY_FOR_CONFIRMATION', 'INSTALL_PATCH_MAY_BE_ACTIVE'},
     'INSTALL_PATCH_MAY_BE_ACTIVE': {'INSTALL_PATCH_AWAITING_OPERATOR_RECONNECT'},
@@ -117,8 +118,9 @@ def _transition(history, state):
         return
     previous = history[-1]['state']
     if any(e['state'].startswith('RO_METADATA_') for e in history):
-        _require(previous == 'RO_METADATA_MAY_BE_ACTIVE' and
-                 state in {'RO_METADATA_OBSERVED', 'RO_METADATA_UNKNOWN'},
+        _require((previous == 'RO_METADATA_MAY_BE_ACTIVE' and
+                  state in {'RO_METADATA_OBSERVED', 'RO_METADATA_UNKNOWN'}) or
+                 (previous == 'RO_METADATA_UNKNOWN' and state == 'RO_METADATA_OBSERVED'),
                  'RO metadata cannot resume, cancel, reconcile or grant install authority')
         return
     if state == 'RO_METADATA_MAY_BE_ACTIVE':

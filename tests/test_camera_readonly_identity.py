@@ -73,6 +73,26 @@ class SimulatedChannel:
         raise AssertionError(name)
 
 
+class LateModelChannel(SimulatedChannel):
+    def read(self, name, missing=False):
+        if name == 'result':
+            self.calls.append(name)
+            if self.fault == 'missing':
+                return None
+            if self.fault == 'result':
+                return self.result[:-1]
+            if self.fault == 'read':
+                raise OSError('unknown late read')
+            return self.result
+        return super().read(name, missing)
+
+    def upload_once(self, *args):
+        raise AssertionError('Late observer must never upload')
+
+    def start_once(self, *args):
+        raise AssertionError('Late observer must never START')
+
+
 class CaptureTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -392,6 +412,122 @@ class CaptureTests(unittest.TestCase):
             self.invoke()
         self.assertEqual(self.channel.calls, [])
 
+    def late_setup(self):
+        self.channel.fault = 'upload'
+        with self.assertRaises(OSError):
+            self.invoke()
+        self.old_lease_instance = self.lease.metadata['instance']
+        self.lease.__exit__(None, None, None)
+        self.lease.__enter__()
+        self.late_folder = self.root / 'late-evidence'
+        self.late_folder.mkdir()
+        self.late_nonce = 'f' * 32
+        self.late_channel = LateModelChannel(self.device, self.result)
+        self.late_approval = dict(operator='SIMULATED LATE OBSERVER', explicit_approval=True,
+                binding=ro.terminal_observation_payload(self.journal, self.context, self.late_folder, self.late_nonce))
+
+    def invoke_late(self, **changes):
+        args = dict(lease=self.lease, journal=self.journal, context=self.context,
+                    approval=self.late_approval, observation_nonce=self.late_nonce, channel=self.late_channel)
+        args.update(changes)
+        return ro.observe_existing_terminal_authenticated(self.device, self.late_folder, **args)
+
+    def test_late_success_only_reads_original_job_under_new_lease(self):
+        self.late_setup()
+        receipt = self.invoke_late()
+        self.assertEqual(self.journal.state, ro.OBSERVED)
+        self.assertEqual(self.late_channel.calls, ['launch', 'ready', 'result', ro.SLOT])
+        observed = receipt['terminal_observation']['context']['lease_identity']['instance']
+        self.assertNotEqual(observed, self.old_lease_instance)
+        self.assertEqual(InstallJournal.open(self.journal.session_dir).state, ro.OBSERVED)
+        assert_operation_allowed(sessions_root=self.root / 'sessions')
+        before = list(self.late_channel.calls)
+        with self.assertRaises(ValueError):
+            self.invoke_late()
+        self.assertEqual(before, self.late_channel.calls)
+
+    def test_late_observer_uses_original_nonce_after_current_profile_changes(self):
+        self.late_setup()
+        with patch.object(ro, 'NONCE', 'a' * 32), patch.object(ro, 'FREEZE_SHA256', '1' * 64):
+            receipt = self.invoke_late()
+        self.assertEqual(receipt['decoded']['nonce'], self.prepared.reference['nonce'])
+        self.assertEqual(self.journal.state, ro.OBSERVED)
+
+    def test_late_missing_result_consumes_attempt_without_clearing_unknown(self):
+        self.late_setup()
+        self.late_channel.fault = 'missing'
+        with self.assertRaises(ValueError):
+            self.invoke_late()
+        self.assertEqual(self.journal.state, ro.UNKNOWN)
+        before = list(self.late_channel.calls)
+        self.late_channel = LateModelChannel(self.device, self.result)
+        # A fresh evidence path/approval cannot replay the same attempt nonce.
+        self.late_folder = self.root / 'another-evidence'
+        self.late_folder.mkdir()
+        self.late_approval['binding'] = ro.terminal_observation_payload(
+                self.journal, self.context, self.late_folder, self.late_nonce)
+        with self.assertRaises(FileExistsError):
+            self.invoke_late()
+        self.assertEqual(self.late_channel.calls, [])
+        with self.assertRaises(JournalError):
+            assert_operation_allowed(sessions_root=self.root / 'sessions')
+
+    def test_late_malformed_result_is_saved_and_stays_unknown(self):
+        self.late_setup()
+        self.late_channel.fault = 'result'
+        with self.assertRaises(ValueError):
+            self.invoke_late()
+        self.assertTrue((self.late_folder / 'result-raw.json').is_file())
+        self.assertEqual(self.journal.state, ro.UNKNOWN)
+
+    def test_late_unknown_read_never_retries(self):
+        self.late_setup()
+        self.late_channel.fault = 'read'
+        with self.assertRaises(OSError):
+            self.invoke_late()
+        self.assertEqual(self.late_channel.calls, ['launch'])
+        self.assertEqual(self.journal.state, ro.UNKNOWN)
+
+    def test_late_wrong_target_source_or_old_approval_does_no_io(self):
+        self.late_setup()
+        for changes in (dict(context=ro.CaptureContext('another-target')),
+                        dict(context=ro.CaptureContext('synthetic-camera', 'HARDWARE', lambda *_: True)),
+                        dict(approval=self.approval)):
+            with self.assertRaises(ValueError):
+                self.invoke_late(**changes)
+        self.assertEqual(self.late_channel.calls, [])
+        self.assertEqual(self.journal.state, ro.UNKNOWN)
+
+    def test_late_physical_transport_cannot_use_simulated_context(self):
+        self.late_setup()
+        channel = ro.TerminalObservationChannel(self.device, bytes.fromhex(ro.NONCE))
+        calls = []
+        channel.send_packet = lambda *args: calls.append(args)
+        with self.assertRaisesRegex(ValueError, 'Physical transport'):
+            self.invoke_late(channel=channel)
+        self.assertEqual(calls, [])
+        self.assertEqual(self.journal.state, ro.UNKNOWN)
+
+    def test_late_occupied_slot_stays_unknown(self):
+        self.late_setup()
+        self.late_channel.fault = 'slot'
+        with self.assertRaises(ValueError):
+            self.invoke_late()
+        self.assertTrue((self.late_folder / 'slot-observation.json').is_file())
+        self.assertEqual(self.journal.state, ro.UNKNOWN)
+
+    def test_late_persistence_failure_cannot_close_unknown(self):
+        self.late_setup()
+        original = ro.durable_new
+        def fail(path, value):
+            if str(path).endswith('result-raw.json'):
+                raise OSError('persistence unknown')
+            return original(path, value)
+        with patch.object(ro, 'durable_new', side_effect=fail):
+            with self.assertRaises(OSError):
+                self.invoke_late()
+        self.assertEqual(self.journal.state, ro.UNKNOWN)
+
     def test_read_and_lifecycle_faults_never_retry(self):
         # Each case owns an isolated fresh journal, lease and nonce namespace.
         for fault in ('loader', 'slot', 'job', 'read', 'exec', 'early', 'ready', 'result', 'START', 'timeout'):
@@ -483,6 +619,21 @@ class ProtocolTests(unittest.TestCase):
         for action in (lambda: channel.read('../../dev/mem'),
                        lambda: channel.write_control('ack', b''),
                        lambda: channel.write_control('start', b'')):
+            with self.assertRaises(ValueError):
+                action()
+        self.assertEqual(calls, [])
+
+    def test_terminal_transport_has_no_upload_start_or_other_file_api(self):
+        channel = ro.TerminalObservationChannel(object(), bytes.fromhex(ro.NONCE))
+        calls = []
+        channel.send_packet = lambda *args: calls.append(args)
+        channel.context_guard = lambda: None
+        for action in (lambda: channel.upload_once(b'', '', ''),
+                       lambda: channel.start_once(''),
+                       lambda: channel.write_control('start', b''),
+                       lambda: channel.assert_job_absent(),
+                       lambda: channel.read('exec_failure'),
+                       lambda: channel.read_loader('/lib/ld-2.25.so')):
             with self.assertRaises(ValueError):
                 action()
         self.assertEqual(calls, [])
