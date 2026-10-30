@@ -98,6 +98,9 @@ class CaptureTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name).resolve()
+        for name in ro.HOST_SOURCES:
+            (self.root / name).write_bytes((ro.ROOT / name).read_bytes())
+        self.enterContext(patch.object(ro, 'ROOT', self.root))
         self.evidence = self.root / 'evidence'
         self.evidence.mkdir()
         self.kit = self.root / 'kit'
