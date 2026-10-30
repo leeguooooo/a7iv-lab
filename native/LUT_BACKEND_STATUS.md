@@ -45,4 +45,6 @@ AV-CAM 由 LIRO 加载，使用 LIRO 复制的 OSAL 接口表。已核对 Linux 
 
 原始IRQ路径`2e4bb0→2e3cdc/2e3fb8/2e3d44→2b4fd8`先清channel5 enable bit0，再写两个ack寄存器，最后读取当前全局client并回调。完整type1超时模型中，超时返回后合成enable位仍置位；替换client后到达的旧IRQ会调用新client。该证据把剩余问题缩小到pending/error位、disable及ack的硬件最后读取合同与可见性，尚不能把这些寄存器操作当作释放屏障。只增加一个回调thunk不足以解决重新启动后的旧IRQ归属。
 
+`output/l3d-dmac-contract-20261031/audit.py` 的37项原指令检查将寄存器和描述符布局与[Linux的PL080定义](https://github.com/torvalds/linux/blob/v6.18/include/linux/amba/pl080.h)对照。原始状态函数`2e4020`检查bit18和bit0，不检查PL080所定义的Active bit17；状态0不能直接解释为FIFO已空。[ARM DDI0196G手册](https://documentation-service.arm.com/static/5e8e3c6488295d1e18d3a8c3)区分Enable、Halt与Active，并给出有条件的停止和传输结束合同。尚未读取此Sony控制器的身份信息，且原厂还写入标准配置字段外的bit24，因此这里只建立结构匹配假设，不能直接套用通用PL080停机或释放流程。
+
 `output/avcam-l3d-queue-error-01/` 是单独离线指令修复候选，只把分配失败时的清零返回改为原错误返回。实际改1字节，5组原API+候选队列控制用例和独立指令复核通过；成功/提交失败路径不变。它不修复超时、硬件停机、颜色格式或用户态桥接，没有完成容器校验/签名/启动验证，不能安装。
