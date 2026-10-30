@@ -44,6 +44,18 @@ flowchart LR
 
 上游依据见 [prepare-display-port.py 第 365 行](https://github.com/16480000/sony-a7iv-qemu/blob/3637f15da850bea406bacd755381020b511b3867/work/sony-a7iv/prepare-display-port.py#L365)。这比搜索到同名字符串更适合用作菜单身份检查，但尚未补齐自定义菜单的全部回调。
 
+本项目的只读工具可直接提取工厂记录，并重新编码核对原字节：
+
+```sh
+.venv-offline/bin/python -B -E -s tools/inspect_m4_factory_registry.py \
+    --ap local/firmware/a7m4-6.02/stock/appFw.so --mode 0x354 \
+    --output output/menu-factory-inspection-NEW.json
+```
+
+工具仅接受明确支持的 stock 或 FL23 AP 哈希，输出文件必须不存在。96 字节记录的两个函数指针以及 `+0x10/+0x14` 两个原始整数已由原厂读取代码核对；整数的业务含义未解释，其余 72 字节原样保留。后续原指令验证确认 `0x1ed6a58` 调用 `+0` 函数，`0x1ed6af4` 调用 `+8` 函数，另有独立函数使用有符号上界 `0x4ce`，并返回 `0x4cf` 作为 sentinel。原判定没有证明负数下界，检查工具自行拒绝负数，不改变原厂代码。
+
+本机检查了 `0..0x4ce` 范围内 1231 条记录，均能原字节往返，记录了 2464 个相关重定位。内部的 `0x36d` 没有 factory，也不能据此当作自由槽。原声音所用卡、文件、确认、等待控制器分别对应 `0x15c/0x16b/0x174/0x2b2`，其 factory 到构造器的直接调用已核对。这些结果不表示新增声音菜单已生成或可达。测试在 `tests/test_m4_factory_registry.py`，原厂文件不随仓库分发。原始消费者与两种 AP 的对照证据保留在本机 `output/stock-factory-consumers-20261030/`。
+
 ## 声音演示怎样触发
 
 `system-sound-model.c` 处理 endpoint `0x92840747` 的 `200d` 消息：`032e` 音量、`033d` 声库地址、`0327` 描述符、`032a` 单项音量、`0328` 路径、`0329` 播放请求。宿主能观察 AP 的请求日志。
