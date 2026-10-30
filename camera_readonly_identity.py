@@ -16,6 +16,7 @@ from camera_device_lease import DEFAULT_LOCK
 from camera_install_journal import InstallJournal
 from camera_install_patch_session import _held_lease
 from camera_operation_guard import DEFAULT_SESSIONS, assert_operation_allowed
+from camera_stream_channel import StreamFileChannel
 from camera_stream_execution import BootstrapChannel, LIBRARIES, SLOT, durable_new, validate_launch as validate_bootstrap_launch
 
 ROOT = Path(__file__).resolve().parent
@@ -24,6 +25,7 @@ FREEZE_SHA256 = 'fa05555e4e8aef36b6c36fb7509bad9aa5831d0e92caba34470c46a0aaba941
 NONCE = '957ba14fe2d99b34871ae4f436d92d96'
 WORKER_SHA256 = '847bf052ef5c4916d71ea9e78f3e61818d2d11725321ecf249882b1baa6a33a7'
 MODULE_SHA256 = 'e2971269981e5d69a8dd754f0c52cb16eb19f23b457fae625498836fcb7afc2a'
+HISTORICAL_DECODERS = {'ro-identity-v1': '2fdcb6bd741970d5c86f6c93867393b085cc14b10f50c8dd4fb8ee286ee12c7e'}
 HEADER = struct.Struct('<8s16sIIqqII36s36s')
 HOST_SOURCES = ('camera_readonly_identity.py', 'camera_device_lease.py', 'camera_install_journal.py',
                 'camera_install_patch_session.py', 'camera_operation_guard.py',
@@ -141,10 +143,13 @@ class CaptureContext:
     """Caller-owned origin binding; callbacks must inspect trusted runtime context.
 
     A dict with source_is_hardware=True is deliberately not accepted. The callback
-    must bind this particular authenticated object and target on every guard. It
+    must bind this particular authenticated object and target on every guard.
     The callback must also establish exclusive device operation ownership for
     the fixed bootstrap cleanup; the host lease alone is only cooperative. It
     remains an assertion by the caller, not cryptographic hardware attestation.
+    This MUST be a pure cached authority check, with no device I/O, discovery,
+    authentication or SDK calls: it also runs before the durable MAY boundary.
+    The host can enforce MAY-before-I/O only for its own IdentityChannel calls.
     """
     target_id: str
     origin: str = 'SIMULATED'
@@ -194,6 +199,61 @@ def validate_approval(approval, prepared, context):
             and approval['binding'] == approval_payload(prepared, context), 'Approval scope or binding differs')
 
 
+def seal_history(prepared, path):
+    """Preserve review bytes; hashes give integrity, never physical authenticity."""
+    reference = prepared.reference
+    blobs = {'host/' + name: safe_path(ROOT / name).read_bytes().hex()
+             for name in reference['host_sources']}
+    for key, name in (('contract', 'contract.py'), ('freeze', 'freeze.json'),
+                      ('manifest', 'canonical/manifest.json')):
+        blobs[key] = safe_path(Path(reference['kit_dir']) / name).read_bytes().hex()
+    snapshot = dict(schema='camera-readonly-identity-history/1', decoder='ro-identity-v1',
+                    asset_reference=reference, blobs=blobs)
+    durable_new(path, snapshot)
+    path.chmod(0o400)
+    item = dict(path=str(path), sha256=sha(path.read_bytes()))
+    validate_history(item, reference)
+    return item
+
+
+def validate_history(item, reference):
+    """Replay a sealed historical review without consulting live source/profile.
+
+    This is a versioned ABI validator. Future profiles add decoder versions;
+    existing versions and their meanings must remain supported.
+    """
+    raw, snapshot = read_json(item['path'])
+    require(sha(raw) == item['sha256'] and snapshot['schema'] == 'camera-readonly-identity-history/1'
+            and snapshot['asset_reference'] == reference, 'Historical snapshot changed')
+    blobs = {key: bytes.fromhex(value) for key, value in snapshot['blobs'].items()}
+    require(set(blobs) == {'host/' + name for name in reference['host_sources']} |
+            {'contract', 'freeze', 'manifest'}, 'Historical source closure differs')
+    require(sha(blobs['contract']) == reference['contract_sha256'] ==
+            HISTORICAL_DECODERS.get(snapshot['decoder']), 'Unsupported historical decoder')
+    require(sha(blobs['freeze']) == reference['freeze_sha256'] and
+            sha(blobs['manifest']) == reference['manifest_sha256'], 'Historical review manifest changed')
+    freeze, manifest = json.loads(blobs['freeze']), json.loads(blobs['manifest'])
+    require(freeze['schema'] == 'readonly-runtime-identity-freeze/1'
+            and manifest['schema'] == 'readonly-runtime-identity-offline/1'
+            and manifest['scope'] == reference['scope'] == 'RO_METADATA'
+            and manifest['nonce'] == reference['nonce']
+            and manifest['job_dir'] == reference['job_dir'] == '/tmp_wbshd/roid_' + reference['nonce']
+            and manifest['worker_sha256'] == reference['worker_sha256']
+            and manifest['bootstrap_sha256'] == reference['module_sha256']
+            and manifest['sources']['contract.py'] == reference['contract_sha256'],
+            'Historical artifact bindings differ')
+    for name, expected in (('canonical/manifest.json', reference['manifest_sha256']),
+                           ('canonical/worker.elf', reference['worker_sha256']),
+                           ('canonical/libJit.so', reference['module_sha256']),
+                           ('contract.py', reference['contract_sha256'])):
+        require(freeze['files'][name]['sha256'] == expected, 'Historical freeze bindings differ')
+    require(reference['host_sources'].get('camera_readonly_identity.py') == reference['host_sha256'],
+            'Historical host binding differs')
+    for name, expected in reference['host_sources'].items():
+        require(sha(blobs['host/' + name]) == expected, 'Historical host source changed')
+    return blobs['contract']
+
+
 def reserve_assets(prepared, evidence, *, lease, journal, device, context, approval):
     require(isinstance(prepared, Prepared), 'Prepared assets required')
     bound = context_binding(context, device, lease, journal, ('PLANNED',))
@@ -212,7 +272,8 @@ def reserve_assets(prepared, evidence, *, lease, journal, device, context, appro
                 not (namespace / (nonce + '.json')).is_symlink(), 'Nonce already consumed')
     claims = safe_path(CLAIMS)
     claims.mkdir(mode=0o700, parents=True, exist_ok=True)
-    record = dict(schema='camera-readonly-identity-reservation/1', context=bound,
+    snapshot = seal_history(prepared, claims / (nonce + '.snapshot.json'))
+    record = dict(schema='camera-readonly-identity-reservation/1', historical_snapshot=snapshot, context=bound,
                   asset_reference=prepared.reference, evidence=str(folder), approval=approval,
                   automatic_retry=False)
     claim = claims / (nonce + '.json')
@@ -273,12 +334,29 @@ def validate_ready(raw, nonce):
                                   bytes(36), bytes(36)), 'Ready schema/nonce/status differs')
 
 
-def decode_result(raw, reference):
-    contract = safe_path(Path(reference['kit_dir']) / 'contract.py').read_bytes()
-    require(sha(contract) == reference['contract_sha256'], 'Bound decoder changed')
+def decode_result(raw, reference, *, historical_contract=None):
+    contract = (safe_path(Path(reference['kit_dir']) / 'contract.py').read_bytes()
+                if historical_contract is None else historical_contract)
+    require(sha(contract) == reference['contract_sha256'] and
+            sha(contract) in HISTORICAL_DECODERS.values(), 'Known reviewed decoder required')
     namespace = {}
     exec(compile(contract, '<pinned readonly contract>', 'exec'), namespace)
     return namespace['decode'](raw, reference['nonce'])
+
+
+def historical_lifecycle_v1(launch, ready, nonce):
+    """Stable schema-1 parser; current profile constants do not define history."""
+    valid_nonce(nonce)
+    require(type(launch) is bytes and len(launch) == 104, 'Historical launch length differs')
+    values = struct.Struct('<8s16s10q').unpack(launch)
+    require(values[:6] == (b'M4BOOT01', bytes.fromhex(nonce), 1, 3, 0, 0)
+            and 1 < values[6] <= 0x7fffffff and values[7] == 0
+            and values[8] > 0 and values[8] == values[9] and values[10] == 0
+            and values[11] >= 8 * 1024 * 1024, 'Historical launch rejected')
+    header = struct.Struct('<8s16sIIqqII36s36s')
+    require(type(ready) is bytes and len(ready) == header.size and
+            header.unpack(ready) == (b'ROID0001', bytes.fromhex(nonce), 1, 1, 0, 0, 0, 0,
+                                     bytes(36), bytes(36)), 'Historical ready rejected')
 
 
 def validate_receipt(receipt, operation):
@@ -302,9 +380,9 @@ def validate_receipt(receipt, operation):
         raws[name] = bytes.fromhex(value['raw_hex'])
         require(len(raws[name]) == value['bytes'], 'Raw length differs')
         require(safe_path(item['path']).parent == safe_path(operation['evidence']), 'Mixed evidence folders')
-    validate_launch(raws['launch'], bytes.fromhex(reference['nonce']))
-    validate_ready(raws['ready'], reference['nonce'])
-    decoded = decode_result(raws['result'], reference)
+    historical_lifecycle_v1(raws['launch'], raws['ready'], reference['nonce'])
+    contract = validate_history(operation['reservation']['record']['historical_snapshot'], reference)
+    decoded = decode_result(raws['result'], reference, historical_contract=contract)
     require(receipt.get('decoded') == decoded, 'Decoded observation differs')
     return receipt
 
@@ -325,17 +403,12 @@ def validate_journal_details(state, details, binding, history, session_dir):
             and context['initial_event_sha256'] == history[0]['event_sha256'], 'RO target/history binding differs')
     reference = operation['asset_reference']
     valid_nonce(reference['nonce'])
-    require(reference['nonce'] == NONCE and reference['scope'] == SCOPE
-            and reference['freeze_sha256'] == FREEZE_SHA256 and reference['worker_sha256'] == WORKER_SHA256
-            and reference['module_sha256'] == MODULE_SHA256
-            and reference['contract_sha256'] == '2fdcb6bd741970d5c86f6c93867393b085cc14b10f50c8dd4fb8ee286ee12c7e'
-            and reference['host_sha256'] == sha(Path(__file__).read_bytes())
-            and reference['host_sources'] == host_source_bindings(),
-            'RO artifact binding differs')
+    require(reference['scope'] == 'RO_METADATA', 'Historical RO scope required')
     reservation = operation['reservation']
     record = reservation['record']
     claim_raw, claimed = read_json(reservation['claim']['path'])
-    require(safe_path(reservation['claim']['path']) == safe_path(CLAIMS / (NONCE + '.json'))
+    validate_history(record['historical_snapshot'], reference)
+    require(safe_path(reservation['claim']['path']).name == reference['nonce'] + '.json'
             and sha(claim_raw) == reservation['claim']['sha256'] and claimed == record
             and record['context'] == context and record['asset_reference'] == reference
             and record['evidence'] == operation['evidence'] and record['automatic_retry'] is False
@@ -364,15 +437,19 @@ def capture_authenticated(device, evidence, *, assets, reservation, lease, journ
     bounded and repeats only a known missing publication, never a failed read.
     """
     bound = context_binding(context, device, lease, journal, ('PLANNED',))
+    if context.origin == 'SIMULATED':
+        require(not isinstance(channel, StreamFileChannel),
+                'Physical transport cannot be classified as a simulated model')
     prepared = preflight_assets(assets)
     validate_approval(approval, prepared, bound)
     folder = safe_path(evidence)
     require(folder.is_dir() and not any(folder.iterdir()), 'Fresh evidence folder required')
     require(type(reservation) is dict and set(reservation) == {'record', 'claim'}, 'Exact reservation required')
     record = reservation['record']
-    require(record == dict(schema='camera-readonly-identity-reservation/1', context=bound,
+    require(record == dict(schema='camera-readonly-identity-reservation/1', historical_snapshot=record.get('historical_snapshot'), context=bound,
                            asset_reference=prepared.reference, evidence=str(folder), approval=approval,
                            automatic_retry=False), 'Reservation binding differs')
+    validate_history(record['historical_snapshot'], prepared.reference)
     claim = reservation['claim']
     require(safe_path(claim['path']) == safe_path(CLAIMS / (prepared.reference['nonce'] + '.json')),
             'Canonical nonce claim required')

@@ -48,12 +48,27 @@ writes and one attempt. The ephemeral lease instance is bound later in the
 reservation and receipt, so approval need not be requested while a lock is held.
 
 `reserve_assets` permanently consumes the nonce across kit/rebuild copies.
+It seals a snapshot of the reviewed freeze/manifest, decoder and host sources
+into the reservation. Historical journal replay verifies those captured bytes,
+not the current host source or current nonce/profile constants. A legitimate
+source/profile update therefore preserves older OBSERVED terminals and older
+UNKNOWN barriers. Historical schema 1 uses a stable lifecycle parser and explicit
+decoder ABI/SHA allowlist; unknown ABIs fail closed. Stored host modules are never
+executed, and a decoder's self-declared hash grants no execution authority. The
+hashes and hash chain detect changes relative to captured references; they do
+not authenticate an operator, a physical camera, or a rewritten entire ledger.
+Current execution still requires the strict current-profile preflight.
 `capture_authenticated` requires that exact reservation, current held lease and
 an explicitly supplied channel on the already authenticated device. Hardware
 calls require the canonical global lease/sessions, exact `IdentityChannel`, and
 a trusted caller callback binding the physical target and exclusive device
 operation ownership. A JSON `source_is_hardware` field cannot establish this
 context; the cooperative host lock alone cannot establish device exclusivity.
+That callback must be a pure cached authority check: it runs before MAY and may
+perform no device I/O, authentication, discovery or SDK calls. The host's
+MAY-before-I/O guarantee covers its own `IdentityChannel` calls, not arbitrary
+caller code. `SIMULATED` requires a separate model double and rejects every known
+`StreamFileChannel`/`BootstrapChannel`/`IdentityChannel` transport before MAY.
 
 Before the first device read, the shared `InstallJournal` durably records
 `RO_METADATA_MAY_BE_ACTIVE`. The host checks nonce-job absence, both original

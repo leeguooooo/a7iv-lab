@@ -12,6 +12,8 @@ import camera_readonly_identity as ro
 
 CONTRACT = b'"""Pure host bounded decoder. No camera/SDK/device imports."""\nimport re,struct\nPATHS=(\'/proc/version\',\'/proc/cmdline\',\'/proc/modules\',\'/proc/interrupts\',\'/proc/self/status\',\'/proc/iomem\',\'/sys/module/liro/parameters/adr\',\'/sys/module/liro/initstate\',\'/proc/sys/kernel/modules_disabled\',\'/proc/sys/kernel/module_sig_enforce\',\'/sys/devices/system/cpu/online\')\nLIMITS=(4096,8192,32768,65536,8192,65536,4096,256,64,64,4096)\nHEADER=struct.Struct(\'<8s16sIIqqII36s36s\');ENTRY=struct.Struct(\'<IiII\')\ndef require(ok,message):\n if not ok:raise ValueError(message)\ndef decode(raw,nonce):\n require(isinstance(raw,bytes) and len(raw)<=200000 and len(raw)>=HEADER.size,\'bounded complete header required\')\n require(isinstance(nonce,str) and re.fullmatch(\'[0-9a-f]{32}\',nonce),\'explicit nonce required\')\n magic,n,v,phase,err,euid,count,res,before,after=HEADER.unpack_from(raw)\n require(magic==b\'ROID0001\' and n.hex()==nonce and v==1 and phase==7 and err==0 and euid==0 and count==11 and res==0,\'schema/nonce/success inconsistency\')\n valid=lambda b:re.fullmatch(b\'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\',b) and b!=b\'00000000-0000-0000-0000-000000000000\'\n require(valid(before) and before==after,\'required exact boot epoch absent/changed\')\n offset=HEADER.size;entries=[];seen=set()\n for _ in range(count):\n  require(offset+ENTRY.size<=len(raw),\'truncated entry\');index,status,length,limit=ENTRY.unpack_from(raw,offset);offset+=ENTRY.size\n  require(index<len(PATHS) and index not in seen,\'unknown/duplicate path\');seen.add(index)\n  require(limit==LIMITS[index] and length<=limit and (status==0 or (-4095<=status<0 and length==0)),\'entry status/limit inconsistency\')\n  require(offset+length<=len(raw),\'truncated value\');value=raw[offset:offset+length];offset+=length\n  entries.append(dict(index=index,path=PATHS[index],status=status,known=status==0,raw_hex=value.hex()))\n require(offset==len(raw),\'trailing bytes\')\n return dict(scope=\'RO_METADATA\',nonce=nonce,boot_epoch=before.decode(),entries=entries,physical_origin_proven=False,full_image_admission=False)\n'
 
+FREEZE = b'{\n  "schema": "readonly-runtime-identity-freeze/1",\n  "canonical_run": "canonical",\n  "files": {\n    "README.md": {\n      "bytes": 5363,\n      "sha256": "0b346cf3cfbf4a95348e82e4459e7fc2b3c7442ad6b25bd2bf74303e1bf40d6a"\n    },\n    "approval-template.json": {\n      "bytes": 388,\n      "sha256": "0036319950813c167bf272e60fb2fcbff612df7cd1b02ad6783943b1993fc0be"\n    },\n    "bootstrap_model.py": {\n      "bytes": 10347,\n      "sha256": "f04a8e0621ca70285677f35f536e471d0c81e296848cea2926f833a0a1e03846"\n    },\n    "build-invocation.json": {\n      "bytes": 3271,\n      "sha256": "3012332b011986df854526511ee5c9d89e10edbb5a5bd9270d38653f9e0ecb34"\n    },\n    "build.py": {\n      "bytes": 3519,\n      "sha256": "5735977515074ffff5f0e21bffd734ed22f06761b54047b915c69e0b08bd1967"\n    },\n    "canonical/bootstrap-model-report.json": {\n      "bytes": 7897,\n      "sha256": "9f3364d77b0f6af8b54bf9e7e40f4b38688c664f85911e5b13de795a7af849b9"\n    },\n    "canonical/bootstrap.compile.log": {\n      "bytes": 0,\n      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"\n    },\n    "canonical/bootstrap.json": {\n      "bytes": 172,\n      "sha256": "7eb51bcda333c0664e45d70eaf8709cd11aef3bd03a3ba0990c8eea9144dad25"\n    },\n    "canonical/compile.log": {\n      "bytes": 0,\n      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"\n    },\n    "canonical/job.h": {\n      "bytes": 168,\n      "sha256": "d4ca03496c38177122e4f5b3bf95d93d614414734de3243709f86093b127ca82"\n    },\n    "canonical/libJit.so": {\n      "bytes": 7416,\n      "sha256": "e2971269981e5d69a8dd754f0c52cb16eb19f23b457fae625498836fcb7afc2a"\n    },\n    "canonical/manifest.json": {\n      "bytes": 3271,\n      "sha256": "3012332b011986df854526511ee5c9d89e10edbb5a5bd9270d38653f9e0ecb34"\n    },\n    "canonical/model-report.json": {\n      "bytes": 106415,\n      "sha256": "e4b67f9c9bdb3909687a65f8f55de11c28a9283dfe6b00786e2e203c5e01a79b"\n    },\n    "canonical/synthetic-decoded.json": {\n      "bytes": 1967,\n      "sha256": "3a414730bb4e2f34e3704c2145ce08ef153ac11c4a3336916b27c10c1fa6ccd7"\n    },\n    "canonical/synthetic-result.bin": {\n      "bytes": 459,\n      "sha256": "2a3e259fc042a8a0da3248afe55ca7b14d1875b303af8db0eb9deb4ea55be07b"\n    },\n    "canonical/worker.elf": {\n      "bytes": 3544,\n      "sha256": "847bf052ef5c4916d71ea9e78f3e61818d2d11725321ecf249882b1baa6a33a7"\n    },\n    "canonical/worker_blob.h": {\n      "bytes": 10591,\n      "sha256": "936bdc6bff6a16e46f49fd8873499efbf188dc683044bee9e71a1304bc6cfec1"\n    },\n    "contract.py": {\n      "bytes": 2063,\n      "sha256": "2fdcb6bd741970d5c86f6c93867393b085cc14b10f50c8dd4fb8ee286ee12c7e"\n    },\n    "launch-plan.json": {\n      "bytes": 2534,\n      "sha256": "d7625f4c1b793c14cfffcb1f9dec86955b63f650b69502d228a34bfccef3678e"\n    },\n    "model.py": {\n      "bytes": 7728,\n      "sha256": "5762b970aa54bf6705c62134b762f8c69f3c9a002e108d2b43b2ed297133c442"\n    },\n    "rebuild/bootstrap.compile.log": {\n      "bytes": 0,\n      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"\n    },\n    "rebuild/compile.log": {\n      "bytes": 0,\n      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"\n    },\n    "rebuild/job.h": {\n      "bytes": 168,\n      "sha256": "d4ca03496c38177122e4f5b3bf95d93d614414734de3243709f86093b127ca82"\n    },\n    "rebuild/libJit.so": {\n      "bytes": 7416,\n      "sha256": "e2971269981e5d69a8dd754f0c52cb16eb19f23b457fae625498836fcb7afc2a"\n    },\n    "rebuild/manifest.json": {\n      "bytes": 3263,\n      "sha256": "4d16d3485230bebddb86742f053e6b47c66473c72a30f9c1ac8f6c5064dd9f73"\n    },\n    "rebuild/worker.elf": {\n      "bytes": 3544,\n      "sha256": "847bf052ef5c4916d71ea9e78f3e61818d2d11725321ecf249882b1baa6a33a7"\n    },\n    "rebuild/worker_blob.h": {\n      "bytes": 10591,\n      "sha256": "936bdc6bff6a16e46f49fd8873499efbf188dc683044bee9e71a1304bc6cfec1"\n    },\n    "rebuild-report.json": {\n      "bytes": 112,\n      "sha256": "de19bbdd38d33e59548d2ec4d5d2aed8721a245b39e7e73cf84ce067ab42cbfe"\n    },\n    "reviewed-inputs.json": {\n      "bytes": 805,\n      "sha256": "6cc93a16cf366e328854d066e4050a6ff57a0563d60d01b2a106c24a131f6aad"\n    },\n    "worker.c": {\n      "bytes": 2981,\n      "sha256": "22c93723630cfdf8ed7bcb2fc460e45dfd814d5d21b9c72694d1b21fb041f2f2"\n    }\n  },\n  "hardware_operations": 0,\n  "physical_origin_proven": false\n}\n'
+MANIFEST = b'{\n  "schema": "readonly-runtime-identity-offline/1",\n  "scope": "RO_METADATA",\n  "nonce": "957ba14fe2d99b34871ae4f436d92d96",\n  "job_dir": "/tmp_wbshd/roid_957ba14fe2d99b34871ae4f436d92d96",\n  "compile_command": [\n    "/workspace/a7iv-lab/local/zig-aarch64-macos-0.15.2/zig",\n    "cc",\n    "-target",\n    "aarch64-linux-gnu",\n    "-mcpu=generic",\n    "-Os",\n    "-ffreestanding",\n    "-fno-builtin",\n    "-fno-stack-protector",\n    "-fno-unwind-tables",\n    "-fno-asynchronous-unwind-tables",\n    "-nostdlib",\n    "-static",\n    "-fno-pic",\n    "-Wl,-e,_start",\n    "-Wl,--no-undefined",\n    "-Wl,--build-id=none",\n    "-Wl,-z,noexecstack",\n    "-Wl,-z,max-page-size=4096",\n    "-I",\n    "/workspace/a7iv-lab/output/readonly-runtime-identity-20261031/canonical",\n    "-I",\n    "/workspace/a7iv-lab/ref/sony-a7m4-custom-firmware/no-fastboot-install/software/app/native",\n    "/workspace/a7iv-lab/output/readonly-runtime-identity-20261031/worker.c",\n    "-o",\n    "/workspace/a7iv-lab/output/readonly-runtime-identity-20261031/canonical/worker.elf"\n  ],\n  "pins": {\n    "local/zig-aarch64-macos-0.15.2/zig": "c65cd34917923f575448cc0603dd7c2326da0af0e5c323043d090662dcdf351c",\n    "ref/sony-a7m4-custom-firmware/no-fastboot-install/software/app/native/linux_a64.h": "827bfa50c9d5e2a1ee8eacc032303844cd3c0a8a9b4f5ea1bfa640a987eedd88",\n    "ref/sony-a7m4-custom-firmware/no-fastboot-install/software/app/native/bootstrap.c": "4e4dcb37eceab654a25b4a7f0d16626d1764f2a9708a48b3275da10c173b19a1"\n  },\n  "sources": {\n    "worker.c": "22c93723630cfdf8ed7bcb2fc460e45dfd814d5d21b9c72694d1b21fb041f2f2",\n    "contract.py": "2fdcb6bd741970d5c86f6c93867393b085cc14b10f50c8dd4fb8ee286ee12c7e",\n    "build.py": "5735977515074ffff5f0e21bffd734ed22f06761b54047b915c69e0b08bd1967",\n    "model.py": "5762b970aa54bf6705c62134b762f8c69f3c9a002e108d2b43b2ed297133c442"\n  },\n  "worker_sha256": "847bf052ef5c4916d71ea9e78f3e61818d2d11725321ecf249882b1baa6a33a7",\n  "hardware_operations": 0,\n  "physical_origin_proven": false,\n  "full_image_admission": false,\n  "bootstrap_compiled": true,\n  "bootstrap_compile_command": [\n    "/workspace/a7iv-lab/local/zig-aarch64-macos-0.15.2/zig",\n    "cc",\n    "-target",\n    "aarch64-linux-gnu",\n    "-Os",\n    "-ffreestanding",\n    "-fno-builtin",\n    "-fno-stack-protector",\n    "-nostdlib",\n    "-shared",\n    "-fPIC",\n    "-Wl,-Bsymbolic",\n    "-Wl,--no-undefined",\n    "-Wl,--build-id=none",\n    "-Wl,-z,noexecstack",\n    "-Wl,-z,max-page-size=4096",\n    "-I",\n    "/workspace/a7iv-lab/output/readonly-runtime-identity-20261031/canonical",\n    "-I",\n    "/workspace/a7iv-lab/ref/sony-a7m4-custom-firmware/no-fastboot-install/software/app/native",\n    "/workspace/a7iv-lab/ref/sony-a7m4-custom-firmware/no-fastboot-install/software/app/native/bootstrap.c",\n    "-o",\n    "/workspace/a7iv-lab/output/readonly-runtime-identity-20261031/canonical/libJit.so"\n  ],\n  "bootstrap_sha256": "e2971269981e5d69a8dd754f0c52cb16eb19f23b457fae625498836fcb7afc2a",\n  "fixed_upload_cleanup": "/tmp/jiritsu/libJit.so",\n  "fixed_upload_cleanup_requires": "exclusive host/device lease and verified current upload ownership; otherwise reject"\n}\n'
 
 class SimulatedChannel:
     def __init__(self, device, result):
@@ -81,10 +83,14 @@ class CaptureTests(unittest.TestCase):
         self.kit = self.root / 'kit'
         self.kit.mkdir()
         (self.kit / 'contract.py').write_bytes(CONTRACT)
+        (self.kit / 'freeze.json').write_bytes(FREEZE)
+        (self.kit / 'canonical').mkdir()
+        (self.kit / 'canonical/manifest.json').write_bytes(MANIFEST)
         self.assertEqual(ro.sha(CONTRACT), '2fdcb6bd741970d5c86f6c93867393b085cc14b10f50c8dd4fb8ee286ee12c7e')
         self.assets = ro.Assets(self.kit, self.root)
         reference = dict(scope=ro.SCOPE, nonce=ro.NONCE, job_dir='/tmp_wbshd/roid_' + ro.NONCE,
                          kit_dir=str(self.kit), source_root=str(self.root), freeze_sha256=ro.FREEZE_SHA256,
+                         manifest_sha256=ro.sha(MANIFEST),
                          worker_sha256=ro.WORKER_SHA256, module_sha256=ro.MODULE_SHA256,
                          contract_sha256=ro.sha(CONTRACT), host_sha256=ro.sha(Path(ro.__file__).read_bytes()), host_sources=ro.host_source_bindings())
         # Artifact transport is simulated; preflight is mocked explicitly. The
@@ -280,11 +286,94 @@ class CaptureTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ro.validate_receipt(receipt, receipt['operation'])
 
-    def test_changed_bound_decoder_cannot_reopen_observed(self):
+    def test_sealed_decoder_survives_live_kit_change(self):
         self.invoke()
         (self.kit / 'contract.py').write_bytes(b'changed')
+        self.assertEqual(InstallJournal.open(self.journal.session_dir).state, ro.OBSERVED)
+
+    def drift(self):
+        from contextlib import ExitStack
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        for name, value in (('NONCE', 'a' * 32), ('FREEZE_SHA256', '1' * 64),
+                            ('WORKER_SHA256', '2' * 64), ('MODULE_SHA256', '3' * 64)):
+            stack.enter_context(patch.object(ro, name, value))
+        stack.enter_context(patch.object(ro, 'host_source_bindings', return_value={'new-source.py': '4' * 64}))
+        return stack
+
+    def test_known_terminal_replays_after_new_profile_and_source_version(self):
+        self.invoke()
+        self.drift()
+        self.assertEqual(InstallJournal.open(self.journal.session_dir).state, ro.OBSERVED)
+        assert_operation_allowed(sessions_root=self.root / 'sessions')
+        fresh = InstallJournal.create(self.root / 'sessions', 'fresh-profile',
+                    plan_sha256='c' * 64, body_sha256='d' * 64, model='synthetic-new-profile')
+        self.assertEqual(fresh.state, 'PLANNED')
+
+    def test_unknown_still_blocks_after_profile_and_source_drift(self):
+        self.channel.fault = 'upload'
+        with self.assertRaises(OSError):
+            self.invoke()
+        self.drift()
+        self.assertEqual(InstallJournal.open(self.journal.session_dir).state, ro.UNKNOWN)
+        with self.assertRaises(JournalError):
+            assert_operation_allowed(sessions_root=self.root / 'sessions')
+        for state in ('STOPPED_UNKNOWN', 'CANCELLED_BEFORE_DEVICE_WRITE',
+                      'MANUALLY_RECONCILED_SAFE', 'FLASH_MAY_HAVE_STARTED'):
+            with self.assertRaises(JournalError):
+                self.journal.advance(state)
+
+    def test_historical_source_tampering_blocks_replay(self):
+        self.invoke()
+        item = self.reservation['record']['historical_snapshot']
+        path = Path(item['path'])
+        snapshot = json.loads(path.read_bytes())
+        snapshot['blobs']['host/camera_stream_channel.py'] = b'changed'.hex()
+        path.chmod(0o600)
+        path.write_text(json.dumps(snapshot))
         with self.assertRaises(ValueError):
             InstallJournal.open(self.journal.session_dir)
+
+    def test_self_consistent_decoder_hash_cannot_authorize_code_execution(self):
+        self.reserve()
+        item = dict(self.reservation['record']['historical_snapshot'])
+        path = Path(item['path'])
+        snapshot = json.loads(path.read_bytes())
+        reference = dict(self.prepared.reference)
+        malicious = b"raise AssertionError('UNREVIEWED DECODER EXECUTED')"
+        reference['contract_sha256'] = ro.sha(malicious)
+        snapshot['asset_reference'] = reference
+        snapshot['blobs']['contract'] = malicious.hex()
+        path.chmod(0o600)
+        path.write_text(json.dumps(snapshot))
+        item['sha256'] = ro.sha(path.read_bytes())
+        with patch('builtins.exec', side_effect=AssertionError('decoder execution forbidden')) as execute:
+            with self.assertRaisesRegex(ValueError, 'Unsupported historical decoder'):
+                ro.validate_history(item, reference)
+            with self.assertRaisesRegex(ValueError, 'Known reviewed decoder'):
+                ro.decode_result(b'', reference, historical_contract=malicious)
+            execute.assert_not_called()
+
+    def test_unknown_historical_abi_fails_closed(self):
+        self.reserve()
+        item = dict(self.reservation['record']['historical_snapshot'])
+        path = Path(item['path'])
+        snapshot = json.loads(path.read_bytes())
+        snapshot['decoder'] = 'unknown-new-ABI'
+        path.chmod(0o600)
+        path.write_text(json.dumps(snapshot))
+        item['sha256'] = ro.sha(path.read_bytes())
+        with self.assertRaisesRegex(ValueError, 'Unsupported historical decoder'):
+            ro.validate_history(item, self.prepared.reference)
+
+    def test_actual_physical_channel_cannot_be_simulated(self):
+        channel = ro.IdentityChannel(self.device, bytes.fromhex(ro.NONCE))
+        calls = []
+        channel.send_packet = lambda *args: calls.append(args)
+        with self.assertRaisesRegex(ValueError, 'Physical transport'):
+            self.invoke(channel=channel)
+        self.assertEqual(calls, [])
+        self.assertEqual(self.journal.state, 'PLANNED')
 
     def test_ro_unknown_cannot_escape_through_old_cancel_or_reconciliation(self):
         self.channel.fault = 'upload'
