@@ -25,6 +25,7 @@ class JournalError(ValueError):
 
 
 STATES = frozenset({
+    'RO_METADATA_MAY_BE_ACTIVE', 'RO_METADATA_OBSERVED', 'RO_METADATA_UNKNOWN',
     'PLANNED', 'SD_STAGE_INTENT', 'SD_STAGED', 'RAM_MAY_BE_ACTIVE', 'RAM_AWAITING_OPERATOR_RECONNECT',
     'READY_FOR_CONFIRMATION', 'FLASH_MAY_HAVE_STARTED',
     'DEVICE_COMPLETION_REPORTED', 'CONTENT_VERIFIED', 'STOPPED_UNKNOWN',
@@ -33,11 +34,12 @@ STATES = frozenset({
     'INSTALL_PATCH_MAY_BE_ACTIVE', 'INSTALL_PATCH_AWAITING_OPERATOR_RECONNECT',
     'INSTALL_READY_FOR_OPERATOR_START', 'INSTALL_PREPARATION_CANCELLED',
 })
-TERMINAL_SAFE = frozenset({'CONTENT_VERIFIED', 'CANCELLED_BEFORE_DEVICE_WRITE',
+TERMINAL_SAFE = frozenset({'RO_METADATA_OBSERVED', 'CONTENT_VERIFIED', 'CANCELLED_BEFORE_DEVICE_WRITE',
                            'MANUALLY_RECONCILED_SAFE', 'RAM_RESTORATION_VERIFIED',
                            'LOCAL_REJECTED_BEFORE_DEVICE_ENTRY', 'INSTALL_PREPARATION_CANCELLED'})
 NEXT = {
-    'PLANNED': {'SD_STAGE_INTENT'},
+    'PLANNED': {'SD_STAGE_INTENT', 'RO_METADATA_MAY_BE_ACTIVE'},
+    'RO_METADATA_MAY_BE_ACTIVE': {'RO_METADATA_OBSERVED', 'RO_METADATA_UNKNOWN'},
     'SD_STAGE_INTENT': {'SD_STAGED'},
     'SD_STAGED': {'RAM_MAY_BE_ACTIVE', 'READY_FOR_CONFIRMATION', 'INSTALL_PATCH_MAY_BE_ACTIVE'},
     'INSTALL_PATCH_MAY_BE_ACTIVE': {'INSTALL_PATCH_AWAITING_OPERATOR_RECONNECT'},
@@ -114,6 +116,13 @@ def _transition(history, state):
         _require(state == 'PLANNED', 'First event must be PLANNED')
         return
     previous = history[-1]['state']
+    if any(e['state'].startswith('RO_METADATA_') for e in history):
+        _require(previous == 'RO_METADATA_MAY_BE_ACTIVE' and
+                 state in {'RO_METADATA_OBSERVED', 'RO_METADATA_UNKNOWN'},
+                 'RO metadata cannot resume, cancel, reconcile or grant install authority')
+        return
+    if state == 'RO_METADATA_MAY_BE_ACTIVE':
+        _require(len(history) == 1 and previous == 'PLANNED', 'Fresh RO-only session required')
     if state == 'LOCAL_REJECTED_BEFORE_DEVICE_ENTRY':
         _require(previous == 'STOPPED_UNKNOWN', 'Local rejection requires STOPPED_UNKNOWN')
         return
@@ -192,6 +201,10 @@ FORMAL_ARTIFACTS = {
 
 
 def _formal_details(state, details, binding, history, session_dir):
+    if state.startswith('RO_METADATA_'):
+        from camera_readonly_identity import validate_journal_details
+        validate_journal_details(state, details, binding, history, session_dir)
+        return
     if state not in FORMAL_ARTIFACTS:
         return
     try:

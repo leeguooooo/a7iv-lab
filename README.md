@@ -28,3 +28,60 @@ Sony A7 IV / ILCE-7M4 的固件研究代码、离线校验工具和分步操作�
 设备、固件和 CPU 模型相关检查依赖研究机本地的精确输入及已审核计划。缺失输入应拒绝执行；干净克隆可以运行模拟及不依赖这些输入的测试，不能直接刷机。历史探针和写入器是研究源码，不属于分步工具公开的实操入口。
 
 第三方来源与固定版本见 [UPSTREAMS.md](UPSTREAMS.md)。不要把解密能力、研究密钥签名或模拟成功当作 Sony 认证、设备接纳或恢复能力的证明。
+
+### RO runtime identity host integration (review only)
+
+`camera_readonly_identity.py` adds a bounded, injected `capture_authenticated`
+path for the separately frozen `output/readonly-runtime-identity-20261031` kit.
+It supplies no discovery, authentication, service entry, STOP, reset, automatic
+retry, RAM patch or firmware install command. An isolated Git worktree is
+explicitly rejected for hardware capture; integration and source review must
+precede any separately authorized physical attempt.
+
+The caller first verifies `Assets(kit_dir, source_root)` with `preflight_assets`.
+This hashes the frozen kit, its sources, native inputs and compiler without
+running them. A fresh `PLANNED` journal, exact target and stable reviewed
+`approval_payload` are required. No approval is generated: the caller must
+provide a separate explicit operator approval. That approval binds the target,
+plan/body/history, scope, artifact and decoder hashes, nonce, declared filesystem
+writes and one attempt. The ephemeral lease instance is bound later in the
+reservation and receipt, so approval need not be requested while a lock is held.
+
+`reserve_assets` permanently consumes the nonce across kit/rebuild copies.
+`capture_authenticated` requires that exact reservation, current held lease and
+an explicitly supplied channel on the already authenticated device. Hardware
+calls require the canonical global lease/sessions, exact `IdentityChannel`, and
+a trusted caller callback binding the physical target and exclusive device
+operation ownership. A JSON `source_is_hardware` field cannot establish this
+context; the cooperative host lock alone cannot establish device exclusivity.
+
+Before the first device read, the shared `InstallJournal` durably records
+`RO_METADATA_MAY_BE_ACTIVE`. The host checks nonce-job absence, both original
+loader library pins, and fixed upload-slot absence before uploading the exact
+bootstrap once. The held lease, absent slot and exact upload bind ownership of
+its fixed-path cleanup. Every packet rechecks lease/history ownership. Ready is
+exactly 128 bytes/version 1, START uses `ROSTART1`, and result is at most 200000
+bytes. Returned lifecycle bytes are persisted before parsing. Only known missing
+publications are polled; failed/unknown reads, writes or persistence are never
+retried.
+
+A validated raw receipt closes only this observation as `RO_METADATA_OBSERVED`.
+Any uncertain outcome remains `RO_METADATA_UNKNOWN` (or durable MAY if recording
+UNKNOWN fails), blocking later operations through the existing global guard
+after lease release. RO history cannot use install cancellation/reconciliation
+or transition to RAM/flash authorization. The receipt proves neither firmware,
+device identity nor image admission. Missing optional sources, including the
+frozen worker's `/proc/sys/kernel/module_sig_enforce` path, remain unknown and
+are never positive module-load admission. The separate native probe's sysfs
+signature-enforcement path is unchanged.
+
+Offline regression checks use Python 3.11+ and temporary simulated fixtures:
+
+```sh
+python -m unittest discover -s tests -p test_camera_readonly_identity.py
+python -m unittest discover -s tests -p test_camera_install_journal.py
+python -m unittest discover -s tests -p test_camera_install_runtime_metadata.py
+python -m unittest discover -s tests -p test_camera_operation_guard.py
+python -m unittest discover -s tests -p test_camera_stream_execution.py
+python -m unittest discover -s tests -p test_camera_device_lease.py
+```
