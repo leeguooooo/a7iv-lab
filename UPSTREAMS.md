@@ -21,3 +21,5 @@
 深入研究时分别核对原厂 AP 执行、虚拟 CP 替身、浏览器声音和网页拍照。网页生成 JPEG、虚拟卡写入或界面显示不能证明真实 ISP、CP、LUT 色彩、快门声音和真机安装通过。
 
 源码路径、已核对的同版菜单锚和复现限制见 [A7 IV QEMU 研究笔记](native/M4_QEMU_NOTES.md)。
+
+2026-10-31 的观察刷新覆盖34个仓库、61个分支及Issue/PR、Release、标签。相较前次快照，M4 QEMU主分支未变；[PMCA RELOADED v1.7.1](https://github.com/masterflai/pmca-re-reloaded/releases/tag/v1.7.1)更新稳定应用发行选择和归档处理，[ZV-E10 QEMU](https://github.com/cokeenet/zve10-qemu/commit/7f6f37e989075aa63fdae9b86eaa0536cb4c4030)补充启动研究记录，[A6000](https://github.com/nicolvus/a6000-fw-decomp/commit/106db716fdee23eeb1c01e43f32cc22efa3d9e3e)推进BootROM与恢复分析。这些变化未提供经核验的M4 LUT或快门声音后端，未替换本项目固定工具链。
