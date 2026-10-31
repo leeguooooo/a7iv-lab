@@ -78,7 +78,7 @@ def source_paths():
     return tuple(sorted(set(review_source_paths()) | TOOL_SOURCES))
 
 
-def validate_config(config_reference, *, injected=False):
+def _config_structure(config_reference, *, injected=False):
     config=_load(config_reference)
     validate_activation_protocol(config.get('card_activation_protocol', EXCLUSIVE_RENAME))
     require(config.get('schema')==CONFIG_SCHEMA and config.get('candidate_sha256')==DIGEST
@@ -101,6 +101,11 @@ def validate_config(config_reference, *, injected=False):
     require(original.get('asset_reference')==config['patch']['asset_reference'],'Patch assets differ from original review')
     local(config['post']['directory'],directory=True)
     require(isinstance(config['post'].get('asset_reference'),dict),'Reviewed post asset reference required')
+    return config
+
+
+def validate_config(config_reference, *, injected=False):
+    config=_config_structure(config_reference,injected=injected)
     sources=config.get('sources');snapshots=local(config['source_snapshot_directory'],directory=True)
     require(isinstance(sources,dict) and sources and 'camera_install_flow.py' in sources,'Current flow source closure required')
     if not injected:require(set(source_paths()).issubset(sources),'Complete current host/SDK source closure required')
@@ -195,7 +200,12 @@ def _open(folder, *, _producer_step=None):
     producer_intent=None
     folder=local(folder,directory=True);header=_load(reference(folder/'flow.json'))
     require(header.get('schema')==SCHEMA and type(header.get('injected_execution')) is bool,'Flow header required')
-    config=validate_config(header['config_reference'],injected=header['injected_execution'])
+    continuation=folder/'source-continuation.json'
+    if continuation.exists() or continuation.is_symlink():
+        from camera_install_flow_continuation import validate_active
+        config=validate_active(folder,header)
+    else:
+        config=validate_config(header['config_reference'],injected=header['injected_execution'])
     events=[];previous='0'*64;active=None;attempts={};completed=set();unknown=False;blocked_reports=[]
     for index,path in enumerate(sorted((folder/'events').iterdir()),1):
         require(path.name==f'{index:08d}.json','Incomplete flow event sequence')
@@ -532,22 +542,33 @@ def run_step(flow_dir, step, *, step_authorized=False, camera_ready=False, opera
     require(not physical or camera_ready is True,'Explicit connected-camera readiness required')
     if not injected:_system(physical)
     operator={} if operator_reference is None else _load(operator_reference)
+    continuation=reference(folder/'source-continuation.json') if (folder/'source-continuation.json').exists() else None
+    def source_context():
+        current_ref=reference(folder/'source-continuation.json') if (folder/'source-continuation.json').exists() else None
+        require(current_ref==continuation,'Source continuation changed during operation')
+        if continuation is not None:
+            from camera_install_flow_continuation import authorize_step
+            authorize_step(folder,step,operator)
+    source_context()
     lease_path=folder/'model-device.lock' if injected else DEFAULT_LOCK
     with CameraDeviceLease('fl23-flow-'+step,lock_path=lease_path) as lease:
         # Repeat local checks under global ownership, before intent or lower I/O.
         _,again,current,current_events,current_journal=_open(folder)
         require(again==header and current==config and current_events==events and current_journal.events==journal.events,'Flow or journal changed before step ownership')
+        source_context()
         assert_operation_allowed(journal,allowed_states=STATES[step]);identity=_held_lease(lease)
         previous_history=deepcopy(journal.events);journal_write_attempted=False
         local_pin=JournalSnapshotPin(journal,lease) if step in HOST_ONLY and not injected else None
         def recording():
             nonlocal journal_write_attempted
             require(_held_lease(lease)==identity and InstallJournal.open(journal.session_dir).events==journal.events,'Flow ownership/history changed before journal record')
+            source_context()
             journal_write_attempted=True
         attempt=max((e['attempt'] for e in events if e['step']==step),default=0)+1
         target=folder/'steps'/(step if attempt==1 else f'{step}-attempt-{attempt:04d}')
         try:
-            _append(folder,events,step,'INTENT',journal_event_sha256=journal.events[-1]['event_sha256'],lease_identity=identity,source_is_hardware=False,automatic_retry=False)
+            _append(folder,events,step,'INTENT',journal_event_sha256=journal.events[-1]['event_sha256'],lease_identity=identity,source_is_hardware=False,automatic_retry=False,
+                    **(dict(source_continuation_reference=continuation) if continuation is not None else {}))
         except BaseException:
             if local_pin is not None:
                 try:local_pin.close()
@@ -555,6 +576,7 @@ def run_step(flow_dir, step, *, step_authorized=False, camera_ready=False, opera
             raise
         try:
             if step!='stage':target.mkdir(mode=0o700)
+            source_context()
             if injected:
                 result=step_injector(step,dict(config=deepcopy(config),journal=journal,evidence=target,operator=deepcopy(operator)))
                 require(isinstance(result,dict) and result.get('source_is_hardware') is False,'Injected actor must explicitly remain nonhardware')
@@ -569,6 +591,7 @@ def run_step(flow_dir, step, *, step_authorized=False, camera_ready=False, opera
                 _validate_blocked_cancel(result['artifact_reference'],journal.binding,previous_history,journal.session_dir,identity)
             if step=='cancel' and not injected and not blocked:
                 require(result.get('cancellation_recorded') is True and journal.state in ('INSTALL_PREPARATION_CANCELLED','CANCELLED_BEFORE_DEVICE_WRITE'),'Cancellation is not terminal')
+            source_context()
             receipt=target/'flow-step-result.json';durable_new(receipt,result)
             if local_pin is not None:local_pin.close();local_pin=None
             _append(folder,events,step,'BLOCKED_READ_ONLY' if blocked else 'COMPLETED',receipt_reference=reference(receipt),source_is_hardware=not injected and physical,
@@ -579,7 +602,7 @@ def run_step(flow_dir, step, *, step_authorized=False, camera_ready=False, opera
                 try:
                     local_pin.check()
                     require(InstallJournal.open(journal.session_dir).events==previous_history==journal.events,'Journal changed after local failure')
-                    require(validate_config(header['config_reference'],injected=False)==config,'Source or assets changed after local failure')
+                    require(_open(folder)[2]==config,'Source or assets changed after local failure')
                     local_pin.close();local_pin=None;rejected_local=True
                 except BaseException:pass
             _append(folder,events,step,'REJECTED_LOCAL' if rejected_local else 'UNKNOWN',error_type=type(error).__name__,
