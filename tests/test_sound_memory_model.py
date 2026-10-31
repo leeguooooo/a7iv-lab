@@ -40,10 +40,11 @@ class SoundMemoryModelTests(unittest.TestCase):
             flags += ["-O2"]
         sources = [ROOT / "native" / name for name in (
             "sound_span.c", "sound_span_model.c", "sound_span_unavailable.c",
-            "sound_cp_backing.c")]
+            "sound_cp_backing.c", "sound_ap_claim.c")]
         if test == "snapshot":
             sources.append(ROOT / "native/sound_snapshot_model.c")
-        sources.append(ROOT / "tools" / f"test_sound_{test}.c")
+        source_name = "ap_claim" if test == "claim" else test
+        sources.append(ROOT / "tools" / f"test_sound_{source_name}.c")
         binary = self.build / f"{test}-{'sanitized' if sanitized else 'strict'}"
         self.run_command([self.compiler, *flags, *sources, "-o", binary])
         result = json.loads(self.run_command([binary]))
@@ -62,6 +63,12 @@ class SoundMemoryModelTests(unittest.TestCase):
         self.assertEqual(strict, sanitized)
         self.assertEqual(strict["success_geometries"], 18)
         self.assertTrue(strict["all_u16_counts_and_states"])
+
+    def test_original_AP_claim_reply_boundary(self):
+        strict = self.compile_and_run("claim", False)
+        sanitized = self.compile_and_run("claim", True)
+        self.assertEqual(strict, sanitized)
+        self.assertTrue(strict["numeric_only"])
 
     def test_unavailable_provider_has_no_link_dependencies(self):
         nm = shutil.which("nm")
