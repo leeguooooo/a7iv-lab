@@ -171,33 +171,11 @@ def init_flow(config_reference, output, *, injected_execution=False):
     return status(folder)
 
 
-def _producer_journal_binding(header, config, intent):
-    """Check only the hash-bound ancestor recorded before a successful actor."""
-    from camera_install_journal import _read_json, _canonical, _binding, _transition
-    session=local(header['journal_session'],directory=True)
-    require(session.parent==DEFAULT_SESSIONS,'Canonical producer journal required')
-    expected=dict(body_sha256=config['body_sha256'],plan_sha256=config['original_plan_reference']['sha256'],model='ILCE-7M4')
-    target=intent.get('journal_event_sha256')
-    require(isinstance(target,str) and len(target)==64,'Producer intent journal ancestor required')
-    history=[]
-    for index in range(1,10001):
-        raw,event=_read_json(session/f'{index:08d}.json')
-        require(set(event)=={'schema','session_id','seq','prev_sha256','binding','state','details','event_sha256'}
-                and raw==_canonical(event) and type(event['schema']) is int and event['schema']==1
-                and type(event['seq']) is int and event['seq']==index and event['session_id']==session.name,
-                'Producer journal ancestor shape differs')
-        _binding(event['binding'])
-        require(event['binding']==expected and event['prev_sha256']==(history[-1]['event_sha256'] if history else '0'*64)
-                and event['event_sha256']==sha(_canonical({k:v for k,v in event.items() if k!='event_sha256'})),
-                'Producer journal ancestor binding/hash differs')
-        _transition(history,event['state']);history.append(event)
-        if event['event_sha256']==target:return expected
-    raise ValueError('Producer journal ancestor exceeded bound')
-
-
 def _open(folder, *, _producer_step=None):
     require(_producer_step is None or _producer_step in ('probe','activate','withdraw'),'Bounded producer step required')
-    producer_intent=None
+    if _producer_step is not None:
+        from camera_install_flow_history import open_producer
+        return open_producer(folder,_producer_step)
     folder=local(folder,directory=True);header=_load(reference(folder/'flow.json'))
     require(header.get('schema')==SCHEMA and type(header.get('injected_execution')) is bool,'Flow header required')
     continuation=folder/'source-continuation.json'
@@ -215,7 +193,6 @@ def _open(folder, *, _producer_step=None):
         if phase=='INTENT':
             require(active is None and not unknown and step not in completed and attempt==attempts.get(step,0)+1,'Invalid or overlapping flow attempt')
             attempts[step]=attempt;active=(step,attempt)
-            if step==_producer_step:producer_intent=event
         else:
             require(active==(step,attempt),'Flow result has no matching active intent')
             active=None
@@ -230,11 +207,6 @@ def _open(folder, *, _producer_step=None):
                 require(step in HOST_ONLY and event.get('journal_unchanged') is True and event.get('SDK_requests_attempted') is False
                     and event.get('manual_instruction_released') is False and event.get('automatic_retry') is False,'Invalid local-only rejection proof')
         events.append(event);previous=event['event_sha256']
-        if step==_producer_step and phase=='COMPLETED':
-            require(producer_intent is not None and header['injected_execution'] is False
-                    and event.get('source_is_hardware') is True,'Real successful producer prefix required')
-            return folder,header,config,events,_producer_journal_binding(header,config,producer_intent)
-    require(_producer_step is None,'Required completed producer step missing')
     journal=InstallJournal.open(local(header['journal_session'],directory=True))
     require(journal.binding==dict(body_sha256=config['body_sha256'],plan_sha256=config['original_plan_reference']['sha256'],model='ILCE-7M4'),'Flow original journal binding changed')
     if not header['injected_execution']:require(journal.session_dir.parent==DEFAULT_SESSIONS,'Canonical production journal required')
@@ -257,16 +229,23 @@ def _unresolved(events):
     return {e['step'] for e in events if e['phase']=='INTENT' and (e['step'],e['attempt']) not in resolved}
 
 
-def status(flow_dir):
-    _,header,_,events,journal=_open(flow_dir)
+def status(flow_dir, *, historical=False):
+    require(type(historical) is bool,'Explicit historical query mode required')
+    if historical:
+        from camera_install_flow_history import open_closed
+        _,header,_,events,journal=open_closed(flow_dir)
+    else:
+        _,header,_,events,journal=_open(flow_dir)
     completed={event['step'] for event in events if event['phase']=='COMPLETED'}
     unknown=_unresolved(events)
-    return dict(state=journal.state,journal_session=str(journal.session_dir),completed_steps=sorted(completed),
+    result=dict(state=journal.state,journal_session=str(journal.session_dir),completed_steps=sorted(completed),
         unresolved_steps=sorted(unknown),blocked=bool(unknown) or journal.state=='STOPPED_UNKNOWN',
         injected_execution=header['injected_execution'],installation_proven=False,automatic_retry=False,
         locally_rejected_steps=sorted({e['step'] for e in events if e['phase']=='REJECTED_LOCAL'}-completed),
         blocked_read_only_steps=sorted({e['step'] for e in events if e['phase']=='BLOCKED_READ_ONLY'}-completed),
         cancellation_recorded=journal.state in ('INSTALL_PREPARATION_CANCELLED','CANCELLED_BEFORE_DEVICE_WRITE'))
+    if historical:result.update(historical_query_only=True,execution_authorized=False)
+    return result
 
 
 def _artifact(events,step):
@@ -621,11 +600,11 @@ def run_step(flow_dir, step, *, step_authorized=False, camera_ready=False, opera
 def main():
     parser=argparse.ArgumentParser(description=__doc__);sub=parser.add_subparsers(dest='command',required=True)
     init=sub.add_parser('init');init.add_argument('--config',required=True);init.add_argument('--config-sha256',required=True);init.add_argument('--output',required=True)
-    show=sub.add_parser('status');show.add_argument('--flow',required=True)
+    show=sub.add_parser('status');show.add_argument('--flow',required=True);show.add_argument('--historical',action='store_true')
     step=sub.add_parser('step');step.add_argument('--flow',required=True);step.add_argument('step',choices=STEPS);step.add_argument('--step-authorized',action='store_true');step.add_argument('--camera-ready',action='store_true');step.add_argument('--operator-artifact');step.add_argument('--operator-sha256')
     args=parser.parse_args();_source_only_runtime()
     if args.command=='init':result=init_flow(dict(path=str(local(args.config)),sha256=args.config_sha256),args.output)
-    elif args.command=='status':result=status(args.flow)
+    elif args.command=='status':result=status(args.flow,historical=args.historical)
     else:
         require((args.operator_artifact is None)==(args.operator_sha256 is None),'Complete operator artifact reference required')
         operator=None if args.operator_artifact is None else dict(path=str(local(args.operator_artifact)),sha256=args.operator_sha256)

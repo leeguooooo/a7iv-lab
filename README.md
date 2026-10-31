@@ -115,3 +115,33 @@ python -m unittest discover -s tests -p test_camera_operation_guard.py
 python -m unittest discover -s tests -p test_camera_stream_execution.py
 python -m unittest discover -s tests -p test_camera_device_lease.py
 ```
+
+### Historical formal-flow evidence
+
+`camera_install_flow_history.py` validates known version-1 producer history as
+data. It verifies the sealed config/header/event and journal prefixes, original
+and continuation source snapshots, the known controller/emulator/helper profile,
+and existing historical pending/runtime receipt validators. It never executes
+archive code or compares historical hashes with current checkout files. Producer
+queries read the bound journal ancestor, so admission/card validation cannot
+recurse into a future journal event.
+
+Current `validate_config`, `init`, `step` and ordinary `status` keep their current
+source checks. For a closed flow, `camera_install_flow.py status --flow ...
+--historical` is an explicit read-only query: it requires CONTENT_VERIFIED and
+recomputes the existing raw capture-run verification before returning. It cannot
+operate devices, continue a flow, authorize firmware, or reconcile UNKNOWN.
+Unsupported historical ABIs/profiles, modified snapshots, mismatched capsule
+references and damaged receipts remain blocking. Hashes preserve integrity
+relative to recorded references; they do not authenticate a rewritten ledger or
+turn a JSON source declaration into physical attestation. New controller ABIs
+must preserve or explicitly extend the historical profile registry.
+
+The post-install proof chain currently repeats substantial local hashing:
+admission/card/probe validation can revisit the same pending/runtime captures
+and source snapshots, and historical closed status recomputes content captures.
+This change adds no cache and makes no performance claim. A later, separate
+performance design should first measure repeated bytes/call paths, then consider
+bounded per-query reuse tied to immutable artifact references and pinned file
+identity. Such reuse must invalidate on drift and must never cache hardware
+liveness, operation authorization, UNKNOWN clearance, or evidence admission.

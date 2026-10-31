@@ -245,14 +245,25 @@ class ContinuationTests(unittest.TestCase):
 
     def test_prefix_survives_new_events_and_old_producer_avoids_future_journal_cycle(self):
         self.activate()
-        flow._append(self.folder, self.events, 'prepare-read', 'INTENT', journal_event_sha256=self.journal.events[-1]['event_sha256'])
+        flow._append(self.folder, self.events, 'prepare-read', 'INTENT',
+                source_continuation_reference=bridge.reference(self.folder/'source-continuation.json'),
+                journal_event_sha256=self.journal.events[-1]['event_sha256'])
         artifact = self.write(self.out / 'new-preparation.json', dict(schema=MODEL))
         wrapper = self.write(self.out / 'new-preparation-result.json', dict(artifact_reference=artifact))
         flow._append(self.folder, self.events, 'prepare-read', 'COMPLETED', receipt_reference=wrapper, source_is_hardware=False)
         # A producer needs only its bound old ancestor; future events may be unreadable
         # while an admission validator is recursively checking that producer.
         (self.journal.session_dir / '00000006.json').write_bytes(b'FUTURE MUST NOT BE OPENED')
-        with patch.object(ledger.InstallJournal, 'open', side_effect=AssertionError('latest journal opened')):
+        import camera_install_flow_history as history
+        with self.subTest('explicit known model ABI'), \
+             patch.multiple(history, ROOT=self.root, DEFAULT_SESSIONS=self.sessions,
+                 BEFORE_CONTROLLER=bridge.BEFORE_CONTROLLER, BEFORE_EMULATOR=bridge.BEFORE_EMULATOR,
+                 AFTER_CONTROLLER=bridge.AFTER_CONTROLLER, AFTER_EMULATOR=bridge.AFTER_EMULATOR,
+                 CONTINUATION_HELPER=flow.sha(self.after[bridge.HELPER]),
+                 APPROVAL_SHA256=bridge.APPROVAL_SHA256, REQUIRED_SOURCES_V1=frozenset(self.before)), \
+             patch.object(history, 'validate_completed_pending', self.pending_check), \
+             patch.object(history, 'validate_completed_runtime', self.runtime_check), \
+             patch.object(ledger.InstallJournal, 'open', side_effect=AssertionError('latest journal opened')):
             _, _, _, prefix, binding = flow._open(self.folder, _producer_step='probe')
         self.assertEqual(prefix[-1]['step'], 'probe')
         self.assertEqual(binding['body_sha256'], self.body)
