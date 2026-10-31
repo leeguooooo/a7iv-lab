@@ -60,6 +60,10 @@ def emulate(directory, scenario, manifest):
     u.mem_map(0x90000000,0x100000);sp=0x90080000;u.reg_write(UC_ARM64_REG_SP,sp)
     u.mem_write(sp,struct.pack('<4Q',2,sp+256,sp+300,0));u.mem_write(sp+256,b'worker\0');u.mem_write(sp+300,b'888\0')
     targets=spec['targets'];memory={};word_reads=Counter();maps_reads=Counter();stat_reads=Counter()
+    processes={}
+    for name,p in targets.items():processes.setdefault(p['pid'],dict(targets=[],memory={},tick=111,missing=False,changed_maps=set()))['targets'].append(name)
+    process_opens=Counter();role_reads=Counter()
+    schedules={'maps':('lib','lib','app','app','lib','app'),'stat':('lib','app','lib','app'),'mem':('lib','app')}
     for name,p in targets.items():
         anchor=bytearray.fromhex(p['anchor_hex']);offset=p['patch_offset']-p['anchor_offset']
         word=p['patch_hex'] if scenario=='patched_patched' or (scenario=='mixed' and name=='app') else p['original_hex']
@@ -69,47 +73,95 @@ def emulate(directory, scenario, manifest):
         memory[name]={p['base_addr']+p['anchor_offset']:anchor,
                       p['base_addr']+p['global_version_offset']:bytearray(p['stock_version'].to_bytes(p['version_bytes'],'little'))}
         if scenario=='lib_version_mismatch' and name=='lib':memory[name][p['base_addr']+p['global_version_offset']][0]^=1
+    for name,p in targets.items():
+        process=processes[p['pid']]
+        for base,raw in memory[name].items():
+            require(not any(base<other+len(data) and other<base+len(raw) for other,data in process['memory'].items()),'Overlapping sparse process fixture')
+            process['memory'][base]=raw
     state=dict(next_fd=3,exit=None,interrupted=False,blocks=0,clock=1000000000,eintr=False,published=False)
-    fds={};calls=Counter();trace=[];preads=[];opens=[];pubwrites=[];blockhash=hashlib.sha256()
+    fds={};calls=Counter();trace=[];preads=[];opens=[];pubwrites=[];process_snapshots=[];fd_namespace_checks=[];blockhash=hashlib.sha256()
     def text(address):
         raw=bytes(u.mem_read(address,512));require(b'\0' in raw,'Unbounded path');return raw.split(b'\0',1)[0].decode()
     def ret(value):u.reg_write(UC_ARM64_REG_X0,value&((1<<64)-1))
-    def target_for(path):
-        for name,p in targets.items():
-            if path.startswith('/proc/'+str(p['pid'])+'/'):return name
-        raise AssertionError('Access outside original fixed PIDs: '+path)
-    def map_data(name):
-        p=targets[name];count=maps_reads[name];inode=112 if name=='lib' else 114
-        if scenario=='lib_maps_change' and name=='lib' and count>=2:inode+=1
-        if scenario=='app_maps_change_after' and name=='app' and count>=3:inode+=1
-        base=p['base_addr']+(4096 if scenario=='lib_base_change' and name=='lib' else 0)
-        span=0x8000 if name=='lib' else 0x3000000
-        return (f'{base:x}-{base+span:x} r-xp 00000000 00:01 {inode} /usr/lib/'+
-                ('libupdaterufp.so' if name=='lib' else 'appFw.so')+'\n').encode()
-    def stat_data(name):
-        p=targets[name];pid=p['pid'];tick=111 if name=='lib' else 222
-        if scenario=='app_stat_change' and name=='app' and stat_reads[name]>=2:tick+=1
-        if scenario=='app_stat_pid_mismatch' and name=='app':pid+=1
-        if scenario=='lib_stat_malformed' and name=='lib':return b'malformed stat\n'
-        return (f'{pid} (synthetic ) task) S '+' '.join(['1']*18)+f' {tick} 0 0 0\n').encode()
-    def memory_read(name,address,count):
-        hits=[(base,raw) for base,raw in memory[name].items() if base<=address and address+count<=base+len(raw)]
-        require(len(hits)==1,'Read outside fixed anchor/version/word fixture')
+    def process_for(path):
+        pieces=path.split('/')
+        require(len(pieces)==4 and pieces[1]=='proc' and pieces[2].isdigit(),'Invalid fixed proc path')
+        pid=int(pieces[2]);require(pid in processes,'Access outside original fixed PIDs: '+path)
+        return pid,processes[pid]
+    def fault_role(pid,kind):
+        # Explicit fault schedule over this fixed worker's syscall sequence. This label
+        # selects injection timing only; it never selects process maps/stat/memory.
+        index=process_opens[kind];process_opens[kind]+=1
+        require(index<len(schedules[kind]),'Unexpected process-open schedule')
+        name=schedules[kind][index]
+        require(targets[name]['pid']==pid,'Process-open schedule PID differs')
+        role_reads[kind,name]+=1
+        return name
+    def map_data(pid):
+        process=processes[pid];rows=[]
+        for name in sorted(process['targets'],key=lambda n:targets[n]['base_addr']):
+            p=targets[name];inode=(112 if name=='lib' else 114)+int(name in process['changed_maps'])
+            base=p['base_addr']+(4096 if scenario=='lib_base_change' and name=='lib' else 0)
+            span=0x8000 if name=='lib' else 0x3000000
+            rows.append(f'{base:x}-{base+span:x} r-xp 00000000 00:01 {inode} /usr/lib/'+('libupdaterufp.so' if name=='lib' else 'appFw.so')+'\n')
+        return ''.join(rows).encode()
+    def stat_data(pid):
+        process=processes[pid]
+        if process.get('malformed_stat'):return b'malformed stat\n'
+        result_pid=pid+int(process.get('stat_pid_mismatch',False))
+        return (f'{result_pid} (synthetic ) task) S '+' '.join(['1']*18)+f" {process['tick']} 0 0 0\n").encode()
+    def memory_read(pid,address,count):
+        hits=[(base,raw) for base,raw in processes[pid]['memory'].items() if base<=address and address+count<=base+len(raw)]
+        require(len(hits)==1,'Read outside fixed process anchor/version/word fixture')
         base,raw=hits[0];return bytes(raw[address-base:address-base+count])
+    def memory_target(pid,address,count):
+        names=[]
+        for name in processes[pid]['targets']:
+            p=targets[name]
+            spans=((p['base_addr']+p['anchor_offset'],len(bytes.fromhex(p['anchor_hex']))),(p['base_addr']+p['global_version_offset'],p['version_bytes']))
+            if any(base<=address and address+count<=base+size for base,size in spans):names.append(name)
+        require(len(names)==1,'Pread address does not identify exactly one target within process')
+        return names[0]
     def syscall(_u,number,_data):
         require(number==2,'Only AArch64 SVC modeled')
         no=u.reg_read(UC_ARM64_REG_X8);a,b,c,d,e,f=[u.reg_read(UC_ARM64_REG_X0+i) for i in range(6)];calls[no]+=1
         if no==56:
             path=text(b)
             if path.startswith('/proc/'):
-                name=target_for(path);kind=path.rsplit('/',1)[1]
+                pid,process=process_for(path);kind=path.rsplit('/',1)[1]
                 require(kind in ('maps','mem','stat') and c==0x88000,'Every process fd must be fixed and O_RDONLY')
-                opens.append(dict(path=path,kind=kind,target=name,flags=c,readonly=True))
-                if scenario=='missing_'+name+'_pid':ret(-2);return
-                if kind=='maps':maps_reads[name]+=1;data=map_data(name)
-                elif kind=='stat':stat_reads[name]+=1;data=stat_data(name)
+                name=fault_role(pid,kind)
+                opens.append(dict(path=path,kind=kind,target=name,pid=pid,flags=c,readonly=True,fault_schedule_role=name))
+                if scenario=='missing_'+name+'_pid':process['missing']=True
+                if process['missing']:ret(-2);return
+                if kind=='maps':
+                    maps_reads[pid]+=1
+                    if scenario=='lib_maps_change' and name=='lib' and role_reads[kind,name]>=2:process['changed_maps'].add('lib')
+                    if scenario=='app_maps_change_after' and name=='app' and role_reads[kind,name]>=3:process['changed_maps'].add('app')
+                    data=map_data(pid)
+                elif kind=='stat':
+                    stat_reads[pid]+=1
+                    if scenario=='app_stat_change' and name=='app' and role_reads[kind,name]>=2:process['tick']+=1
+                    if scenario=='app_stat_pid_mismatch' and name=='app':process['stat_pid_mismatch']=True
+                    if scenario=='lib_stat_malformed' and name=='lib':process['malformed_stat']=True
+                    data=stat_data(pid)
                 else:data=b''
-                row=dict(kind=kind,target=name,data=data,pos=0,path=path)
+                process_snapshots.append(dict(pid=pid,kind=kind,fault_schedule_role=name,data_hex=data.hex()))
+                if kind=='mem':
+                    probes=[]
+                    for target in process['targets']:
+                        p=targets[target];address=p['base_addr']+p['anchor_offset'];raw=memory_read(pid,address,len(bytes.fromhex(p['anchor_hex'])))
+                        probes.append(dict(target=target,address=hex(address),raw_hex=raw.hex()))
+                    rejects=[]
+                    for other_pid,other_process in processes.items():
+                        if other_pid==pid:continue
+                        for target in other_process['targets']:
+                            p=targets[target];address=p['base_addr']+p['anchor_offset']
+                            try:memory_read(pid,address,len(bytes.fromhex(p['anchor_hex'])))
+                            except ValueError:rejects.append(target)
+                            else:raise AssertionError('Cross-process sparse memory was visible')
+                    fd_namespace_checks.append(dict(pid=pid,opening_fault_role=name,fixture_probes_only=True,accessible_targets=probes,rejected_other_process_targets=rejects))
+                row=dict(kind=kind,target=name,pid=pid,data=data,pos=0,path=path)
             else:
                 require(path in {job+'/'+n for n in ('start','ready','result.pending')},'Unexpected job path')
                 writing=c==0x880c1;require(writing or c==0x88000,'Unexpected job flags')
@@ -128,7 +180,7 @@ def emulate(directory, scenario, manifest):
                 if row['kind']=='maps' and scenario==row['target']+'_maps_close_error':code=-5
                 if row['kind']=='stat' and scenario==row['target']+'_stat_close_error':code=-5
                 if row['kind']=='file' and row.get('write') and scenario==row['label']+'_close_error':code=-5
-                trace.append(dict(event='close',kind=row['kind'],target=row.get('target'),returned=code))
+                trace.append(dict(event='close',kind=row['kind'],target=row.get('target'),pid=row.get('pid'),fd=a,returned=code))
             ret(code)
         elif no==63:
             row=fds[a];require(row['kind']!='mem','Memory reads must use pread')
@@ -143,18 +195,18 @@ def emulate(directory, scenario, manifest):
             if count>0:files[row['path']]+=raw[:count]
             pubwrites.append(dict(record=label,requested=c,returned=count,cumulative=len(files[row['path']])));ret(count)
         elif no==67:
-            row=fds[a];require(row['kind']=='mem','Only readonly memory fds may pread');name=row['target'];p=targets[name]
+            row=fds[a];require(row['kind']=='mem','Only readonly memory fds may pread');name=memory_target(row['pid'],d,c);p=targets[name]
             require(c in (2,4,20,32),'Unexpected read size');kind='word' if d==p['target_addr'] else 'version' if d==p['base_addr']+p['global_version_offset'] else 'anchor'
             if kind=='word':
                 word_reads[name]+=1
                 if scenario==name+'_word_change' and word_reads[name]>=2:
                     base=p['base_addr']+p['anchor_offset'];off=p['patch_offset']-p['anchor_offset'];memory[name][base][off:off+4]=bytes.fromhex(p['patch_hex'])
-            raw=memory_read(name,d,c);count=c
+            raw=memory_read(row['pid'],d,c);count=c
             if scenario==name+'_'+kind+'_short':count=c//2
             if scenario==name+'_'+kind+'_error':count=-5
             if scenario=='pread_eintr' and not state['eintr']:state['eintr']=True;count=-4
             if count>0:u.mem_write(b,raw[:count])
-            preads.append(dict(target=name,kind=kind,address=hex(d),requested=c,returned=count,raw_hex=raw[:max(0,count)].hex()))
+            preads.append(dict(target=name,pid=row['pid'],fd=a,kind=kind,address=hex(d),requested=c,returned=count,raw_hex=raw[:max(0,count)].hex()))
             trace.append(dict(event='pread',target=name,kind=kind,returned=count))
             ret(count)
             stop=scenario=='interrupted_first_word' and kind=='word' and name=='lib'
@@ -210,6 +262,8 @@ def emulate(directory, scenario, manifest):
         model_interrupted=state['interrupted'],native_terminal=terminal,observation=accepted,
         process_memory_writes=0,all_memory_opens_readonly=True,process_opens=opens,pread_events=preads,
         trace=trace,publication_write_events=pubwrites,publication_hex={name:(files.get(job+'/'+name) or b'').hex() for name in ('ready','result','result.pending')},
+        process_snapshots=process_snapshots,fd_namespace_checks=fd_namespace_checks,
+        process_model={str(pid):dict(targets=p['targets'],tick=p['tick'],missing=p['missing'],memory_ranges=[dict(address=hex(base),bytes=len(raw)) for base,raw in p['memory'].items()]) for pid,p in processes.items()},
         native_basic_blocks_executed=state['blocks'],basic_block_trace_sha256=blockhash.hexdigest(),
         syscall_counts=dict(calls),hardware_operations=0,original_mm_continuity_proven=False,restoration_proven=False,
         installation_authorized=False)
