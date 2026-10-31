@@ -1,5 +1,6 @@
 #include "sound_snapshot_model.h"
 #include "sound_span_model.h"
+#include "sound_cp_backing.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -218,9 +219,20 @@ static void invalid_arguments(void)
     CHECK(ss_model_read_log(s,NULL) == SS_ARGUMENT);
     ss_model_snapshot_destroy(s);
 }
+static void default_backing_unavailable(void)
+{
+    cs_cp_backing backing;
+    unsigned char before[sizeof(backing)];
+    memset(&backing,0xa5,sizeof(backing));
+    memcpy(before,&backing,sizeof(backing));
+    CHECK(cs_cp_backing_bind(&backing,17U,handles) == CS_CP_UNAVAILABLE);
+    CHECK(memcmp(before,&backing,sizeof(backing)) == 0);
+    CHECK(cs_cp_backing_bind(NULL,17U,handles) == CS_CP_UNAVAILABLE);
+}
 int main(void)
 {
     successes(); invalid_fields(); bounds(); geometry_rejections(); invalid_arguments();
+    default_backing_unavailable();
     printf("{\"checks\":%u,\"success_geometries\":18,\"all_u16_counts_and_states\":true,\"passed\":true}\n",checks);
     return 0;
 }

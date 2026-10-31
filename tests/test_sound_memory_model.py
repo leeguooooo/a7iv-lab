@@ -39,7 +39,8 @@ class SoundMemoryModelTests(unittest.TestCase):
         else:
             flags += ["-O2"]
         sources = [ROOT / "native" / name for name in (
-            "sound_span.c", "sound_span_model.c", "sound_span_unavailable.c")]
+            "sound_span.c", "sound_span_model.c", "sound_span_unavailable.c",
+            "sound_cp_backing.c")]
         if test == "snapshot":
             sources.append(ROOT / "native/sound_snapshot_model.c")
         sources.append(ROOT / "tools" / f"test_sound_{test}.c")
@@ -66,11 +67,12 @@ class SoundMemoryModelTests(unittest.TestCase):
         nm = shutil.which("nm")
         if nm is None:
             self.skipTest("nm is required to inspect object dependencies")
-        stub = self.build / "real_unavailable.o"
-        self.run_command([self.compiler, "-std=c11", "-Wall", "-Wextra", "-Werror",
-                          "-O2", "-c", ROOT / "native/sound_span_unavailable.c",
-                          "-o", stub])
-        self.assertEqual(self.run_command([nm, "-u", stub]).strip(), "")
+        for source in ("sound_span_unavailable.c", "sound_cp_backing.c"):
+            with self.subTest(source=source):
+                stub = self.build / (source + ".o")
+                self.run_command([self.compiler, "-std=c11", "-Wall", "-Wextra", "-Werror",
+                                  "-O2", "-c", ROOT / "native" / source, "-o", stub])
+                self.assertEqual(self.run_command([nm, "-u", stub]).strip(), "")
 
 
 if __name__ == "__main__":
