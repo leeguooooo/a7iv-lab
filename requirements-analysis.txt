@@ -1,0 +1,2 @@
+# Parser used by offline ELF extension checks; no device access.
+pyelftools==0.32
