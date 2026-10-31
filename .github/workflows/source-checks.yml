@@ -26,3 +26,4 @@ jobs:
           python -m unittest discover -s tests -p test_camera_operation_guard.py
           python -m unittest discover -s tests -p test_camera_package_audit.py
           python -m unittest discover -s tests -p test_fl23_prewrite_guard.py
+          python -m unittest discover -s tests -p test_sound_memory_model.py
