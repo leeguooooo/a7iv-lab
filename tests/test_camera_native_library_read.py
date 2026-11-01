@@ -6,7 +6,7 @@ from camera_native_library_read import NativeLibraryReader
 
 
 class NativeLibraryReadTests(unittest.TestCase):
-    def reader(self, failure=None):
+    def reader(self, failure=None, payload=b'\x7fELF-data'):
         calls = []
         def packet(device, function, frame, sink):
             block, command = struct.unpack_from('<HH', frame)
@@ -15,7 +15,7 @@ class NativeLibraryReadTests(unittest.TestCase):
             if failure == command:
                 sink.write(struct.pack('<I', 1))
             else:
-                sink.write(struct.pack('<I', 0) + (b'\x7fELF-data' if command == 17 else b''))
+                sink.write(struct.pack('<I', 0) + (payload if command == 17 else b''))
             return 0, None
         return NativeLibraryReader(SimpleNamespace(driver=object()), bytes(16), send_packet=packet), calls
 
@@ -43,6 +43,15 @@ class NativeLibraryReadTests(unittest.TestCase):
             before = list(calls)
             with self.assertRaises(RuntimeError): reader.read('libosal_uipc.so')
             self.assertEqual(calls, before)
+
+    def test_exact_limit_is_read_but_oversize_stops_channel(self):
+        reader, _ = self.reader(payload=b'x' * 65536)
+        self.assertEqual(len(reader.read('libosal_utm.so')), 65536)
+        reader, calls = self.reader(payload=b'x' * 65537)
+        with self.assertRaises(ValueError): reader.read('libosal_utm.so')
+        before = list(calls)
+        with self.assertRaises(RuntimeError): reader.read('libosal_uipc.so')
+        self.assertEqual(calls, before)
 
 
 if __name__ == '__main__': unittest.main()
