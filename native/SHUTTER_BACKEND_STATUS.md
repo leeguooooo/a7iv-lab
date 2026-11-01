@@ -46,6 +46,10 @@
 
 ## 事件线程与真实入口核查
 
+随后改用项目既有的Adjust1001选择文件/GET协议，已从机身正常环境读回两份原生库：`libosal_utm.so`为10216字节、SHA256 `d9510b4ce1d7e59a0f2e9b5be14624a4cece6f514879e8a6d23ce890a46d25eb`；`libosal_uipc.so`为43752字节、SHA256 `09ebf5980237fc473077dc844763dcb00cba423f431646e3be7c0ca49ea70ff3`。它们与更新环境的库不相同。`output/osal-normal-provider-abi-20261101/`按实机文件重新执行12项trampoline/长度检查和7项线程创建检查；正常消息长度入口为7E08，source getter为7E28，分别读取负载前8、12字节。`output/ap-normal-osal-receive-20261101/`另有6项跨模块检查，将原AP接收/解码器的source调用接到实机库原始指令，替代原source替身；队列、释放、pthread和调度等替身仍明确保留。这些执行没有产生真实曝光事件或播放。
+
+原错误128来自SDK通用FileControl路径，不能据此断言机身不支持上述既有读取协议。公共`camera_native_library_read.py`只选择并GET这两份固定库，每份最多65536字节；不提供上传、执行、内存、模式切换或通用路径。一次失败会阻断后续读取，不自动重发。4项主机检查覆盖精确容量、超限、错误及重复请求。临时采集器仅在本机编译和模型检查，从未上传。成功读取后退出并经操作者再次拔插，已观察普通ILCE-7M4 USB及两卷恢复；先前卡在libusb退出清理的主机进程已在保存回执、释放租约后结束。真实曝光身份、完整固件和出声验收仍未完成。
+
 已在现有6.02更新系统归档中找到真实提供者：`libosal_utm.so`（SHA256 `c3047f937f50eed6a73f7a02f05c95d1b7dc515750d2d634817a668e6dbe78f5`）和`libosal_uipc.so`（SHA256 `2d899fdbb3befed231f05ae7efd1a3689921e07e1125527d1c9fc602a67ebbec`）。本机`output/osal-provider-abi-20261101/`的12项检查执行原始线程trampoline与消息长度函数，另7项执行原始线程创建路径。40字节spec中的name、entry、arg、subsystem、priority偏移得到该提供者代码支持，type0有正常调度路径，消息长度来自负载前8字节。创建路径既可能返回正的线程ID，也可能直接返回正的pthread属性初始化错误；worker实际进入才可发布READY。pthread、调度、syscall和回调仍有明确替身，不能证明真实调度或拍摄环境的库版本。
 
 2026-11-01接入相机后，普通USB型号查询已返回ILCE-7M4并保存回执。通过原有服务文件接口读取第一份正常环境OSAL库时，相机返回错误128，未继续读取第二份；没有上传程序或写入固件。另行发送一次STOP取得已知PIPE响应，但随后仅观察到096F USB Bus-powered Device，尚未验证普通USB恢复。不能把更新环境的库冒充已从正常拍摄环境取得的库。
