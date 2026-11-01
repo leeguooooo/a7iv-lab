@@ -30,3 +30,4 @@ jobs:
           python -m unittest discover -s tests -p test_fl23_prewrite_guard.py
           python -m unittest discover -s tests -p test_sound_memory_model.py
           python -m unittest discover -s tests -p test_camera_elf_extension.py
+          python -m unittest discover -s tests -p test_camera_native_library_read.py
