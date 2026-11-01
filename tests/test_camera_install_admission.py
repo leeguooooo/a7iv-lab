@@ -154,4 +154,52 @@ class RecoveryTests(unittest.TestCase):
         with self.assertRaises(ValueError):self.validate()
 
 
+class AdmissionFilesystemReplayTests(unittest.TestCase):
+    def check_receipt(self, stored, observed):
+        binding=dict(body_sha256='b'*64,plan_sha256='a'*64,model='ILCE-7M4')
+        report=dict(schema=admission.SCHEMA,state='FULL_INSTALL_ADMISSION_RECORDED',
+            **binding,session_id='attempt',candidate_sha256=admission.DIGEST,
+            write_scope='full_sd',installation_authorized=True,manual_start_required=True,
+            **dict.fromkeys(admission.FALSE_CLAIMS,False),references={},proof=stored)
+        with patch.object(admission,'load_reference',return_value=(b'',report)),patch.object(admission,'_admit',return_value=observed):
+            return admission.validate_admission_receipt({},binding,[],Path('/attempt'))
+
+    def proof(self, first, second):
+        return dict(provenance='DECLARED_DEFAULT_COLLECTOR_NOT_CRYPTO_ATTESTED',
+            recovery=dict(known_gaps=['independent_medium_missing:P1'],
+                physical_recovery_guaranteed=False,copy_filesystem_facts=[dict(
+                    partition='P1',primary_filesystem_device=first,copy_filesystem_device=second,
+                    same_filesystem=first==second,copy_bytes_match=True,
+                    physical_media_independence_proven=False)]))
+
+    def test_remounted_device_numbers_preserve_receipt(self):
+        old=self.proof(16777234,16777234);new=self.proof(16777232,16777232)
+        self.assertEqual(self.check_receipt(old,new)['proof'],old)
+        self.assertEqual(new,self.proof(16777232,16777232))
+
+    def test_changed_filesystem_relationship_is_rejected(self):
+        old=self.proof(10,10);new=self.proof(20,21)
+        with self.assertRaisesRegex(ValueError,'Admission proof differs'):
+            self.check_receipt(old,new)
+
+    def test_cross_partition_filesystem_relationship_is_preserved(self):
+        old=self.proof(10,10);new=self.proof(20,20)
+        old['recovery']['copy_filesystem_facts'].append(dict(
+            partition='P2',primary_filesystem_device=10,copy_filesystem_device=10))
+        new['recovery']['copy_filesystem_facts'].append(dict(
+            partition='P2',primary_filesystem_device=21,copy_filesystem_device=21))
+        with self.assertRaisesRegex(ValueError,'Admission proof differs'):
+            self.check_receipt(old,new)
+
+    def test_changed_recovery_claim_and_other_evidence_are_rejected(self):
+        old=self.proof(10,10)
+        for field,value in [('known_gaps',[]),('physical_recovery_guaranteed',True)]:
+            new=self.proof(20,20);new['recovery'][field]=value
+            with self.subTest(field=field),self.assertRaisesRegex(ValueError,'Admission proof differs'):
+                self.check_receipt(old,new)
+        new=self.proof(20,20);new['provenance']='different'
+        with self.assertRaisesRegex(ValueError,'Admission proof differs'):
+            self.check_receipt(old,new)
+
+
 if __name__=='__main__':unittest.main()

@@ -190,6 +190,26 @@ def _admit(references, binding, history, session_dir):
         receiver_proof=runtime['receiver_proof'], recovery=recovery, provenance='DECLARED_DEFAULT_COLLECTOR_NOT_CRYPTO_ATTESTED')
 
 
+def _stable_admission_proof(proof):
+    """Compare filesystem relationships, not remount-dependent st_dev values.
+
+    Content and recovery validation still run in _admit. Keep every other fact
+    and the equality relationships across all backup filesystems unchanged.
+    """
+    require(isinstance(proof, dict), 'Admission proof differs from completed evidence')
+    stable = deepcopy(proof)
+    devices = {}
+    for fact in stable.get('recovery', {}).get('copy_filesystem_facts', []):
+        for field in ('primary_filesystem_device', 'copy_filesystem_device'):
+            if field in fact:
+                device = fact[field]
+                require(type(device) is int and device >= 0, 'Invalid filesystem device observation')
+                if device not in devices:
+                    devices[device] = len(devices)
+                fact[field] = devices[device]
+    return stable
+
+
 def validate_admission_receipt(reference, binding, history, session_dir):
     _, report = load_reference(reference)
     require(report.get('schema') == SCHEMA and report.get('state') == 'FULL_INSTALL_ADMISSION_RECORDED'
@@ -198,7 +218,8 @@ def validate_admission_receipt(reference, binding, history, session_dir):
             and report.get('installation_authorized') is True and report.get('manual_start_required') is True
             and all(report.get(name) is False for name in FALSE_CLAIMS), 'Full-install admission scope differs')
     proof = _admit(report.get('references'),binding,history,session_dir)
-    require(report.get('proof') == proof, 'Admission proof differs from completed evidence')
+    require(_stable_admission_proof(report.get('proof')) == _stable_admission_proof(proof),
+            'Admission proof differs from completed evidence')
     return report
 
 
