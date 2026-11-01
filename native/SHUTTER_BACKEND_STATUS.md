@@ -46,6 +46,10 @@
 
 ## 事件线程与真实入口核查
 
+已在现有6.02更新系统归档中找到真实提供者：`libosal_utm.so`（SHA256 `c3047f937f50eed6a73f7a02f05c95d1b7dc515750d2d634817a668e6dbe78f5`）和`libosal_uipc.so`（SHA256 `2d899fdbb3befed231f05ae7efd1a3689921e07e1125527d1c9fc602a67ebbec`）。本机`output/osal-provider-abi-20261101/`的12项检查执行原始线程trampoline与消息长度函数，另7项执行原始线程创建路径。40字节spec中的name、entry、arg、subsystem、priority偏移得到该提供者代码支持，type0有正常调度路径，消息长度来自负载前8字节。创建路径既可能返回正的线程ID，也可能直接返回正的pthread属性初始化错误；worker实际进入才可发布READY。pthread、调度、syscall和回调仍有明确替身，不能证明真实调度或拍摄环境的库版本。
+
+2026-11-01接入相机后，普通USB型号查询已返回ILCE-7M4并保存回执。通过原有服务文件接口读取第一份正常环境OSAL库时，相机返回错误128，未继续读取第二份；没有上传程序或写入固件。另行发送一次STOP取得已知PIPE响应，但随后仅观察到096F USB Bus-powered Device，尚未验证普通USB恢复。不能把更新环境的库冒充已从正常拍摄环境取得的库。
+
 `output/ap-stock-receive-lifetime-20261101/` 新增6项原始AP指令检查，在原厂与FL23两份映像分别执行超时、UI来源type4和其他来源type0分支。原始接收器`1840824`成功后，在`1840894`将context、消息指针槽和输出record交给解码器`1840588`，随后`18408A4`释放原消息。测试在释放替身中覆盖原消息，确认此前复制的输出仍保持；超时不调用解码或释放，栈与callee-saved寄存器保持。队列、source、释放提供者及通用消息remap仍有明确替身，不能证明实际capture通知。该位置只确定了消息寿命和调用参数，没有写入观察hook，也没有证明1001/F000及所谓capture key的身份。
 
 已复现并修复观察回调越过线程边界的问题：旧`csnd_event_exposure → admit`会调用读取原生策略的`csnd_ap_playback_ticket`，但原生getter契约要求工作线程。`tools/derive_sound_event_boundary.py`按三份固定源码身份派生修复，新增只读私有代数快照；它仅尝试一次自身状态锁，不读取原生策略、不分配或读写文件、不触发持久化排空。工作线程仍按当前原生策略、配置代数和epoch重新准入。800字节配置ABI及持久化布局不变。
